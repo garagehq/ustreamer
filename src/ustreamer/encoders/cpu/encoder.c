@@ -43,6 +43,7 @@ static void _jpeg_write_scanlines_grey(struct jpeg_compress_struct *jpeg, const 
 static void _jpeg_write_scanlines_rgb565(struct jpeg_compress_struct *jpeg, const us_frame_s *frame);
 static void _jpeg_write_scanlines_rgb24(struct jpeg_compress_struct *jpeg, const us_frame_s *frame);
 static void _jpeg_write_scanlines_nv12(struct jpeg_compress_struct *jpeg, const us_frame_s *frame);
+static void _jpeg_write_scanlines_nv12_downscale(struct jpeg_compress_struct *jpeg, const us_frame_s *frame);
 static void _jpeg_write_scanlines_nv16(struct jpeg_compress_struct *jpeg, const us_frame_s *frame);
 static void _jpeg_write_scanlines_nv24(struct jpeg_compress_struct *jpeg, const us_frame_s *frame);
 #ifndef JCS_EXTENSIONS
@@ -68,8 +69,11 @@ void us_cpu_encoder_compress(const us_frame_s *src, us_frame_s *dest, uint quali
 
 	_jpeg_set_dest_frame(&jpeg, dest);
 
-	jpeg.image_width = src->width;
-	jpeg.image_height = src->height;
+	// For NV12 4K content, downscale 2x to improve FPS
+	// This is a performance optimization for RK3588 HDMI capture
+	const bool downscale_nv12 = (src->format == V4L2_PIX_FMT_NV12 && src->height >= 2160);
+	jpeg.image_width = downscale_nv12 ? src->width / 2 : src->width;
+	jpeg.image_height = downscale_nv12 ? src->height / 2 : src->height;
 	jpeg.input_components = 3;
 	switch (src->format) {
 		case V4L2_PIX_FMT_YUYV:
@@ -118,7 +122,11 @@ void us_cpu_encoder_compress(const us_frame_s *src, us_frame_s *dest, uint quali
 			break;
 
 		case V4L2_PIX_FMT_NV12:
-			_jpeg_write_scanlines_nv12(&jpeg, src);
+			if (downscale_nv12) {
+				_jpeg_write_scanlines_nv12_downscale(&jpeg, src);
+			} else {
+				_jpeg_write_scanlines_nv12(&jpeg, src);
+			}
 			break;
 
 		case V4L2_PIX_FMT_NV16:
@@ -375,6 +383,52 @@ static void _jpeg_write_scanlines_nv12(struct jpeg_compress_struct *jpeg, const 
 		JSAMPROW scanlines[1] = {line_buf};
 		jpeg_write_scanlines(jpeg, scanlines, 1);
 		y_row++;
+	}
+
+	free(line_buf);
+}
+
+// NV12 with 2x downscaling: averages 2x2 Y blocks and uses center UV
+// Output is half width and half height - for 4K to 1080p conversion
+static void _jpeg_write_scanlines_nv12_downscale(struct jpeg_compress_struct *jpeg, const us_frame_s *frame) {
+	const uint out_width = frame->width / 2;
+	const uint out_height = frame->height / 2;
+
+	u8 *line_buf;
+	US_CALLOC(line_buf, out_width * 3);
+
+	const uint frame_size = frame->width * frame->height;
+	const u8 *y_plane = frame->data;
+	const u8 *uv_plane = frame->data + frame_size;
+
+	uint out_row = 0;
+	while (jpeg->next_scanline < out_height) {
+		u8 *ptr = line_buf;
+		// Source rows: 2 Y rows per output row
+		const uint src_y_row = out_row * 2;
+		const u8 *y_row0 = y_plane + src_y_row * frame->width;
+		const u8 *y_row1 = y_plane + (src_y_row + 1) * frame->width;
+		// UV row (4:2:0 means one UV row per 2 Y rows)
+		const u8 *uv_row = uv_plane + (src_y_row / 2) * frame->width;
+
+		for (uint out_x = 0; out_x < out_width; out_x++) {
+			const uint src_x = out_x * 2;
+
+			// Average 2x2 Y block
+			const uint y_sum = y_row0[src_x] + y_row0[src_x + 1] +
+			                   y_row1[src_x] + y_row1[src_x + 1];
+			ptr[0] = (u8)(y_sum >> 2);  // Divide by 4
+
+			// UV: use center value (already subsampled, just pick appropriate pair)
+			const uint uv_x = src_x & ~1;
+			ptr[1] = uv_row[uv_x];      // U (Cb)
+			ptr[2] = uv_row[uv_x + 1];  // V (Cr)
+			ptr += 3;
+		}
+
+		JSAMPROW scanlines[1] = {line_buf};
+		jpeg_write_scanlines(jpeg, scanlines, 1);
+		out_row++;
 	}
 
 	free(line_buf);
