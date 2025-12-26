@@ -82,8 +82,8 @@ void us_cpu_encoder_compress(const us_frame_s *src, us_frame_s *dest, uint quali
 		case V4L2_PIX_FMT_NV12:
 		case V4L2_PIX_FMT_NV16:
 		case V4L2_PIX_FMT_NV24:
-			// NV formats are converted to RGB before JPEG encoding
-			jpeg.in_color_space = JCS_RGB;
+			// NV formats are converted directly to YCbCr (native JPEG format)
+			jpeg.in_color_space = JCS_YCbCr;
 			break;
 		case V4L2_PIX_FMT_GREY:
 			jpeg.input_components = 1;
@@ -345,134 +345,104 @@ static void _jpeg_write_scanlines_rgb24(struct jpeg_compress_struct *jpeg, const
 }
 
 // NV12: Y plane followed by interleaved UV plane (4:2:0 subsampling)
+// Optimized: uses line buffer and outputs YCbCr directly (no RGB conversion)
 static void _jpeg_write_scanlines_nv12(struct jpeg_compress_struct *jpeg, const us_frame_s *frame) {
-	u8 *rgb;
-	US_CALLOC(rgb, frame->width * frame->height * 3);
+	u8 *line_buf;
+	US_CALLOC(line_buf, frame->width * 3);
 
 	const uint frame_size = frame->width * frame->height;
 	const u8 *y_plane = frame->data;
 	const u8 *uv_plane = frame->data + frame_size;
 
-	for (uint i = 0; i < frame->height; i++) {
-		for (uint j = 0; j < frame->width; j++) {
-			const uint uv_index = (i / 2) * frame->width + (j & ~1);
-			const int Y = y_plane[i * frame->width + j];
-			const int U = uv_plane[uv_index] - 128;
-			const int V = uv_plane[uv_index + 1] - 128;
-
-			// YUV to RGB conversion (BT.601)
-			const int C = Y - 16;
-			int R = (298 * C + 409 * V + 128) >> 8;
-			int G = (298 * C - 100 * U - 208 * V + 128) >> 8;
-			int B = (298 * C + 516 * U + 128) >> 8;
-
-			// Clamp to [0, 255]
-			R = (R < 0) ? 0 : ((R > 255) ? 255 : R);
-			G = (G < 0) ? 0 : ((G > 255) ? 255 : G);
-			B = (B < 0) ? 0 : ((B > 255) ? 255 : B);
-
-			const uint rgb_index = (i * frame->width + j) * 3;
-			rgb[rgb_index] = (u8)R;
-			rgb[rgb_index + 1] = (u8)G;
-			rgb[rgb_index + 2] = (u8)B;
-		}
-	}
-
-	u8 *data = rgb;
+	uint y_row = 0;
 	while (jpeg->next_scanline < frame->height) {
-		JSAMPROW scanlines[1] = {data};
+		u8 *ptr = line_buf;
+		const u8 *y_row_data = y_plane + y_row * frame->width;
+		// UV row is half the Y row (4:2:0 vertical subsampling)
+		const u8 *uv_row_data = uv_plane + (y_row / 2) * frame->width;
+
+		for (uint x = 0; x < frame->width; x++) {
+			// Y value directly from Y plane
+			ptr[0] = y_row_data[x];
+			// U and V are interleaved, shared by 2x2 Y block
+			// UV index: (x & ~1) gives even index for both x and x+1
+			const uint uv_x = x & ~1;
+			ptr[1] = uv_row_data[uv_x];      // U (Cb)
+			ptr[2] = uv_row_data[uv_x + 1];  // V (Cr)
+			ptr += 3;
+		}
+
+		JSAMPROW scanlines[1] = {line_buf};
 		jpeg_write_scanlines(jpeg, scanlines, 1);
-		data += frame->width * 3;
+		y_row++;
 	}
 
-	free(rgb);
+	free(line_buf);
 }
 
 // NV16: Y plane followed by interleaved UV plane (4:2:2 subsampling)
+// Optimized: uses line buffer and outputs YCbCr directly (no RGB conversion)
 static void _jpeg_write_scanlines_nv16(struct jpeg_compress_struct *jpeg, const us_frame_s *frame) {
-	u8 *rgb;
-	US_CALLOC(rgb, frame->width * frame->height * 3);
+	u8 *line_buf;
+	US_CALLOC(line_buf, frame->width * 3);
 
 	const uint frame_size = frame->width * frame->height;
 	const u8 *y_plane = frame->data;
 	const u8 *uv_plane = frame->data + frame_size;
 
-	for (uint i = 0; i < frame->height; i++) {
-		for (uint j = 0; j < frame->width; j++) {
-			const uint uv_index = i * frame->width + (j & ~1);
-			const int Y = y_plane[i * frame->width + j];
-			const int U = uv_plane[uv_index] - 128;
-			const int V = uv_plane[uv_index + 1] - 128;
-
-			// YUV to RGB conversion (BT.601)
-			int R = (298 * (Y - 16) + 409 * V + 128) >> 8;
-			int G = (298 * (Y - 16) - 100 * U - 208 * V + 128) >> 8;
-			int B = (298 * (Y - 16) + 516 * U + 128) >> 8;
-
-			// Clamp to [0, 255]
-			R = (R < 0) ? 0 : ((R > 255) ? 255 : R);
-			G = (G < 0) ? 0 : ((G > 255) ? 255 : G);
-			B = (B < 0) ? 0 : ((B > 255) ? 255 : B);
-
-			const uint rgb_index = (i * frame->width + j) * 3;
-			rgb[rgb_index] = (u8)R;
-			rgb[rgb_index + 1] = (u8)G;
-			rgb[rgb_index + 2] = (u8)B;
-		}
-	}
-
-	u8 *data = rgb;
+	uint y_row = 0;
 	while (jpeg->next_scanline < frame->height) {
-		JSAMPROW scanlines[1] = {data};
+		u8 *ptr = line_buf;
+		const u8 *y_row_data = y_plane + y_row * frame->width;
+		// NV16: UV row is same as Y row (4:2:2 - no vertical subsampling)
+		const u8 *uv_row_data = uv_plane + y_row * frame->width;
+
+		for (uint x = 0; x < frame->width; x++) {
+			ptr[0] = y_row_data[x];
+			const uint uv_x = x & ~1;
+			ptr[1] = uv_row_data[uv_x];      // U (Cb)
+			ptr[2] = uv_row_data[uv_x + 1];  // V (Cr)
+			ptr += 3;
+		}
+
+		JSAMPROW scanlines[1] = {line_buf};
 		jpeg_write_scanlines(jpeg, scanlines, 1);
-		data += frame->width * 3;
+		y_row++;
 	}
 
-	free(rgb);
+	free(line_buf);
 }
 
 // NV24: Y plane followed by interleaved UV plane (4:4:4 - no subsampling)
+// Optimized: uses line buffer and outputs YCbCr directly (no RGB conversion)
 static void _jpeg_write_scanlines_nv24(struct jpeg_compress_struct *jpeg, const us_frame_s *frame) {
-	u8 *rgb;
-	US_CALLOC(rgb, frame->width * frame->height * 3);
+	u8 *line_buf;
+	US_CALLOC(line_buf, frame->width * 3);
 
 	const uint frame_size = frame->width * frame->height;
 	const u8 *y_plane = frame->data;
 	const u8 *uv_plane = frame->data + frame_size;
 
-	for (uint i = 0; i < frame->height; i++) {
-		for (uint j = 0; j < frame->width; j++) {
-			const uint y_index = i * frame->width + j;
-			const uint uv_index = y_index * 2;
-			const int Y = y_plane[y_index];
-			const int U = uv_plane[uv_index] - 128;
-			const int V = uv_plane[uv_index + 1] - 128;
-
-			// YUV to RGB conversion (BT.601)
-			int R = (298 * (Y - 16) + 409 * V + 128) >> 8;
-			int G = (298 * (Y - 16) - 100 * U - 208 * V + 128) >> 8;
-			int B = (298 * (Y - 16) + 516 * U + 128) >> 8;
-
-			// Clamp to [0, 255]
-			R = (R < 0) ? 0 : ((R > 255) ? 255 : R);
-			G = (G < 0) ? 0 : ((G > 255) ? 255 : G);
-			B = (B < 0) ? 0 : ((B > 255) ? 255 : B);
-
-			const uint rgb_index = y_index * 3;
-			rgb[rgb_index] = (u8)R;
-			rgb[rgb_index + 1] = (u8)G;
-			rgb[rgb_index + 2] = (u8)B;
-		}
-	}
-
-	u8 *data = rgb;
+	uint y_row = 0;
 	while (jpeg->next_scanline < frame->height) {
-		JSAMPROW scanlines[1] = {data};
+		u8 *ptr = line_buf;
+		const u8 *y_row_data = y_plane + y_row * frame->width;
+		// NV24: 2 UV bytes per Y pixel (4:4:4 - no subsampling)
+		const u8 *uv_row_data = uv_plane + y_row * frame->width * 2;
+
+		for (uint x = 0; x < frame->width; x++) {
+			ptr[0] = y_row_data[x];
+			ptr[1] = uv_row_data[x * 2];      // U (Cb)
+			ptr[2] = uv_row_data[x * 2 + 1];  // V (Cr)
+			ptr += 3;
+		}
+
+		JSAMPROW scanlines[1] = {line_buf};
 		jpeg_write_scanlines(jpeg, scanlines, 1);
-		data += frame->width * 3;
+		y_row++;
 	}
 
-	free(rgb);
+	free(line_buf);
 }
 
 #ifndef JCS_EXTENSIONS
