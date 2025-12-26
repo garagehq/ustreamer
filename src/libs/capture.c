@@ -142,7 +142,7 @@ us_capture_s *us_capture_init(void) {
 	cap->io_method = V4L2_MEMORY_MMAP;
 	cap->n_bufs = us_get_cores_available() + 1;
 	cap->min_frame_size = 128;
-	cap->timeout = 1;
+	cap->timeout = 5;  // Increased for RK3588 HDMI-RX compatibility
 	cap->run = run;
 	return cap;
 }
@@ -481,45 +481,56 @@ void us_capture_hwbuf_decref(us_capture_hwbuf_s *hw) {
 int _capture_wait_buffer(us_capture_s *cap) {
 	us_capture_runtime_s *const run = cap->run;
 
-#	define INIT_FD_SET(x_set) \
-		fd_set x_set; FD_ZERO(&x_set); FD_SET(run->fd, &x_set);
-	INIT_FD_SET(read_fds);
-	INIT_FD_SET(error_fds);
-#	undef INIT_FD_SET
+	// Retry up to 3 times before giving up (for RK3588 HDMI-RX compatibility)
+	const int max_retries = 3;
 
-	// Раньше мы проверяли и has_write, но потом выяснилось, что libcamerify зачем-то
-	// генерирует эвенты на запись, вероятно ошибочно. Судя по всему, игнорирование
-	// has_write не делает никому плохо.
+	for (int retry = 0; retry < max_retries; retry++) {
+#		define INIT_FD_SET(x_set) \
+			fd_set x_set; FD_ZERO(&x_set); FD_SET(run->fd, &x_set);
+		INIT_FD_SET(read_fds);
+		INIT_FD_SET(error_fds);
+#		undef INIT_FD_SET
 
-	struct timeval timeout;
-	timeout.tv_sec = cap->timeout;
-	timeout.tv_usec = 0;
+		// Раньше мы проверяли и has_write, но потом выяснилось, что libcamerify зачем-то
+		// генерирует эвенты на запись, вероятно ошибочно. Судя по всему, игнорирование
+		// has_write не делает никому плохо.
 
-	_LOG_DEBUG("Calling select() on video device ...");
+		struct timeval timeout;
+		timeout.tv_sec = cap->timeout;
+		timeout.tv_usec = 0;
 
-	bool has_read = false;
-	bool has_error = false;
-	const int selected = select(run->fd + 1, &read_fds, NULL, &error_fds, &timeout);
-	if (selected > 0) {
-		has_read = FD_ISSET(run->fd, &read_fds);
-		has_error = FD_ISSET(run->fd, &error_fds);
-	}
-	_LOG_DEBUG("Device select() --> %d; has_read=%d, has_error=%d", selected, has_read, has_error);
+		_LOG_DEBUG("Calling select() on video device (attempt %d/%d)...", retry + 1, max_retries);
 
-	if (selected < 0) {
-		if (errno != EINTR) {
-			_LOG_PERROR("Device select() error");
+		bool has_read = false;
+		bool has_error = false;
+		const int selected = select(run->fd + 1, &read_fds, NULL, &error_fds, &timeout);
+		if (selected > 0) {
+			has_read = FD_ISSET(run->fd, &read_fds);
+			has_error = FD_ISSET(run->fd, &error_fds);
 		}
-		return -1;
-	} else if (selected == 0) {
-		_LOG_ERROR("Device select() timeout");
-		return -1;
-	} else {
-		if (has_error && _capture_consume_event(cap) < 0) {
-			return -1; // Restart required
+		_LOG_DEBUG("Device select() --> %d; has_read=%d, has_error=%d", selected, has_read, has_error);
+
+		if (selected < 0) {
+			if (errno != EINTR) {
+				_LOG_PERROR("Device select() error");
+			}
+			return -1;
+		} else if (selected == 0) {
+			// Timeout - retry if we have attempts left
+			if (retry < max_retries - 1) {
+				_LOG_DEBUG("Device select() timeout, retrying (%d/%d)...", retry + 1, max_retries);
+				continue;
+			}
+			_LOG_ERROR("Device select() timeout after %d attempts", max_retries);
+			return -1;
+		} else {
+			if (has_error && _capture_consume_event(cap) < 0) {
+				return -1; // Restart required
+			}
+			return 0;  // Success
 		}
 	}
-	return 0;
+	return -1;  // Should not reach here
 }
 
 static int _capture_consume_event(const us_capture_s *cap) {
