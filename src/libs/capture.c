@@ -65,6 +65,9 @@ static const struct {
 	const char *name; // cppcheck-suppress unusedStructMember
 	const uint format; // cppcheck-suppress unusedStructMember
 } _FORMATS[] = {
+	{"NV12",	V4L2_PIX_FMT_NV12},
+	{"NV16",	V4L2_PIX_FMT_NV16},
+	{"NV24",	V4L2_PIX_FMT_NV24},
 	{"YUYV",	V4L2_PIX_FMT_YUYV},
 	{"YVYU",	V4L2_PIX_FMT_YVYU},
 	{"UYVY",	V4L2_PIX_FMT_UYVY},
@@ -733,12 +736,27 @@ static int _capture_open_format(us_capture_s *cap, bool first) {
 
 	const uint stride = us_align_size(run->width, 32) << 1;
 
+	// For multiplanar devices (like RK3588 HDMI-RX), query current format first
+	// The device may only support certain formats based on the input signal
+	uint device_format = cap->format;
+	if (run->capture_mplane) {
+		struct v4l2_format query_fmt = {0};
+		query_fmt.type = run->capture_type;
+		_LOG_DEBUG("Querying current device format for mplane device ...");
+		if (us_xioctl(run->fd, VIDIOC_G_FMT, &query_fmt) == 0) {
+			device_format = query_fmt.fmt.pix_mp.pixelformat;
+			_LOG_INFO("Device reports format: %s (%ux%u)",
+				_format_to_string_supported(device_format),
+				query_fmt.fmt.pix_mp.width, query_fmt.fmt.pix_mp.height);
+		}
+	}
+
 	struct v4l2_format fmt = {0};
 	fmt.type = run->capture_type;
 	if (run->capture_mplane) {
 		fmt.fmt.pix_mp.width = run->width;
 		fmt.fmt.pix_mp.height = run->height;
-		fmt.fmt.pix_mp.pixelformat = cap->format;
+		fmt.fmt.pix_mp.pixelformat = device_format; // Use device's format for mplane
 		fmt.fmt.pix_mp.field = V4L2_FIELD_ANY;
 		fmt.fmt.pix_mp.flags = 0;
 		fmt.fmt.pix_mp.num_planes = 1;
@@ -752,7 +770,7 @@ static int _capture_open_format(us_capture_s *cap, bool first) {
 
 	// Set format
 	_LOG_DEBUG("Probing device format=%s, stride=%u, resolution=%ux%u ...",
-		_format_to_string_supported(cap->format), stride, run->width, run->height);
+		_format_to_string_supported(run->capture_mplane ? device_format : cap->format), stride, run->width, run->height);
 	if (us_xioctl(run->fd, VIDIOC_S_FMT, &fmt) < 0) {
 		_LOG_PERROR("Can't set device format");
 		return -1;
