@@ -26,6 +26,7 @@
 
 
 #include "encoder.h"
+#include "../../encoder.h"  // For us_g_encode_scale
 
 
 typedef struct {
@@ -43,7 +44,7 @@ static void _jpeg_write_scanlines_grey(struct jpeg_compress_struct *jpeg, const 
 static void _jpeg_write_scanlines_rgb565(struct jpeg_compress_struct *jpeg, const us_frame_s *frame);
 static void _jpeg_write_scanlines_rgb24(struct jpeg_compress_struct *jpeg, const us_frame_s *frame);
 static void _jpeg_write_scanlines_nv12(struct jpeg_compress_struct *jpeg, const us_frame_s *frame);
-static void _jpeg_write_scanlines_nv12_downscale(struct jpeg_compress_struct *jpeg, const us_frame_s *frame);
+static void _jpeg_write_scanlines_nv12_downscale(struct jpeg_compress_struct *jpeg, const us_frame_s *frame, uint target_width, uint target_height);
 static void _jpeg_write_scanlines_nv16(struct jpeg_compress_struct *jpeg, const us_frame_s *frame);
 static void _jpeg_write_scanlines_nv24(struct jpeg_compress_struct *jpeg, const us_frame_s *frame);
 #ifndef JCS_EXTENSIONS
@@ -69,11 +70,44 @@ void us_cpu_encoder_compress(const us_frame_s *src, us_frame_s *dest, uint quali
 
 	_jpeg_set_dest_frame(&jpeg, dest);
 
-	// For NV12 4K content, downscale 2x to improve FPS
-	// This is a performance optimization for RK3588 HDMI capture
-	const bool downscale_nv12 = (src->format == V4L2_PIX_FMT_NV12 && src->height >= 2160);
-	jpeg.image_width = downscale_nv12 ? src->width / 2 : src->width;
-	jpeg.image_height = downscale_nv12 ? src->height / 2 : src->height;
+	// Calculate target dimensions based on encode scale setting
+	// This is a performance optimization for high-resolution content
+	uint target_width = src->width;
+	uint target_height = src->height;
+	bool downscale_nv12 = false;
+
+	if (src->format == V4L2_PIX_FMT_NV12) {
+		switch (us_g_encode_scale) {
+			case US_ENCODE_SCALE_1080P:
+				// Force 1080p output
+				if (src->height > 1080) {
+					target_width = 1920;
+					target_height = 1080;
+					downscale_nv12 = true;
+				}
+				break;
+			case US_ENCODE_SCALE_2K:
+				// Force 2K (1440p) output
+				if (src->height > 1440) {
+					target_width = 2560;
+					target_height = 1440;
+					downscale_nv12 = true;
+				}
+				break;
+			case US_ENCODE_SCALE_NATIVE:
+			default:
+				// Auto: downscale 4K to 1080p for performance
+				if (src->height >= 2160) {
+					target_width = src->width / 2;
+					target_height = src->height / 2;
+					downscale_nv12 = true;
+				}
+				break;
+		}
+	}
+
+	jpeg.image_width = target_width;
+	jpeg.image_height = target_height;
 	jpeg.input_components = 3;
 	switch (src->format) {
 		case V4L2_PIX_FMT_YUYV:
@@ -123,7 +157,7 @@ void us_cpu_encoder_compress(const us_frame_s *src, us_frame_s *dest, uint quali
 
 		case V4L2_PIX_FMT_NV12:
 			if (downscale_nv12) {
-				_jpeg_write_scanlines_nv12_downscale(&jpeg, src);
+				_jpeg_write_scanlines_nv12_downscale(&jpeg, src, target_width, target_height);
 			} else {
 				_jpeg_write_scanlines_nv12(&jpeg, src);
 			}
@@ -388,39 +422,42 @@ static void _jpeg_write_scanlines_nv12(struct jpeg_compress_struct *jpeg, const 
 	free(line_buf);
 }
 
-// NV12 with 2x downscaling: averages 2x2 Y blocks and uses center UV
-// Output is half width and half height - for 4K to 1080p conversion
-static void _jpeg_write_scanlines_nv12_downscale(struct jpeg_compress_struct *jpeg, const us_frame_s *frame) {
-	const uint out_width = frame->width / 2;
-	const uint out_height = frame->height / 2;
-
+// NV12 with downscaling to target resolution
+// Optimized: pre-compute X lookup table, use integer math
+static void _jpeg_write_scanlines_nv12_downscale(struct jpeg_compress_struct *jpeg, const us_frame_s *frame, uint target_width, uint target_height) {
 	u8 *line_buf;
-	US_CALLOC(line_buf, out_width * 3);
+	US_CALLOC(line_buf, target_width * 3);
+
+	// Pre-compute X coordinate lookup table (avoids per-pixel division)
+	uint *x_lookup;
+	US_CALLOC(x_lookup, target_width);
+	for (uint out_x = 0; out_x < target_width; out_x++) {
+		// Map output X to source X using integer math
+		x_lookup[out_x] = (out_x * frame->width) / target_width;
+	}
 
 	const uint frame_size = frame->width * frame->height;
 	const u8 *y_plane = frame->data;
 	const u8 *uv_plane = frame->data + frame_size;
+	const uint src_width = frame->width;
+	const uint src_height = frame->height;
 
 	uint out_row = 0;
-	while (jpeg->next_scanline < out_height) {
+	while (jpeg->next_scanline < target_height) {
+		// Map output Y to source Y
+		const uint src_y = (out_row * src_height) / target_height;
+		const u8 *y_row = y_plane + src_y * src_width;
+		const u8 *uv_row = uv_plane + (src_y >> 1) * src_width;
+
 		u8 *ptr = line_buf;
-		// Source rows: 2 Y rows per output row
-		const uint src_y_row = out_row * 2;
-		const u8 *y_row0 = y_plane + src_y_row * frame->width;
-		const u8 *y_row1 = y_plane + (src_y_row + 1) * frame->width;
-		// UV row (4:2:0 means one UV row per 2 Y rows)
-		const u8 *uv_row = uv_plane + (src_y_row / 2) * frame->width;
+		for (uint out_x = 0; out_x < target_width; out_x++) {
+			const uint src_x = x_lookup[out_x];
 
-		for (uint out_x = 0; out_x < out_width; out_x++) {
-			const uint src_x = out_x * 2;
+			// Y value from source pixel
+			ptr[0] = y_row[src_x];
 
-			// Average 2x2 Y block
-			const uint y_sum = y_row0[src_x] + y_row0[src_x + 1] +
-			                   y_row1[src_x] + y_row1[src_x + 1];
-			ptr[0] = (u8)(y_sum >> 2);  // Divide by 4
-
-			// UV: use center value (already subsampled, just pick appropriate pair)
-			const uint uv_x = src_x & ~1;
+			// UV: get from subsampled UV plane
+			const uint uv_x = src_x & ~1u;
 			ptr[1] = uv_row[uv_x];      // U (Cb)
 			ptr[2] = uv_row[uv_x + 1];  // V (Cr)
 			ptr += 3;
@@ -431,6 +468,7 @@ static void _jpeg_write_scanlines_nv12_downscale(struct jpeg_compress_struct *jp
 		out_row++;
 	}
 
+	free(x_lookup);
 	free(line_buf);
 }
 

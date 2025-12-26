@@ -124,6 +124,8 @@ enum _US_OPT_VALUES {
 #	endif
 	_O_NOTIFY_PARENT,
 
+	_O_ENCODE_SCALE,
+
 	_O_LOG_LEVEL,
 	_O_PERF,
 	_O_VERBOSE,
@@ -158,6 +160,7 @@ static const struct option _LONG_OPTS[] = {
 	{"device-timeout",			required_argument,	NULL,	_O_DEVICE_TIMEOUT},
 	{"device-error-delay",		required_argument,	NULL,	_O_DEVICE_ERROR_DELAY},
 	{"m2m-device",				required_argument,	NULL,	_O_M2M_DEVICE},
+	{"encode-scale",			required_argument,	NULL,	_O_ENCODE_SCALE},
 
 	{"image-default",			no_argument,		NULL,	_O_IMAGE_DEFAULT},
 	{"brightness",				required_argument,	NULL,	_O_BRIGHTNESS},
@@ -402,6 +405,7 @@ int options_parse(us_options_s *options, us_capture_s *cap, us_encoder_s *enc, u
 			case _O_DEVICE_TIMEOUT:		OPT_NUMBER("--device-timeout", cap->timeout, 1, 60, 0);
 			case _O_DEVICE_ERROR_DELAY:	OPT_NUMBER("--device-error-delay", stream->error_delay, 1, 60, 0);
 			case _O_M2M_DEVICE:			OPT_SET(enc->m2m_path, optarg);
+			case _O_ENCODE_SCALE:		OPT_PARSE_ENUM("encode scale", us_g_encode_scale, us_encoder_parse_scale, ENCODE_SCALE_STR);
 
 			case _O_IMAGE_DEFAULT:
 				OPT_CTL_DEFAULT_NOBREAK(brightness);
@@ -687,6 +691,11 @@ static void _help(FILE *fp, const us_capture_s *cap, const us_encoder_s *enc, co
 	SAY("    --device-error-delay <sec>  ────────── Delay before trying to connect to the device again");
 	SAY("                                           after an error (timeout for example). Default: %u.\n", stream->error_delay);
 	SAY("    --m2m-device </dev/path>  ──────────── Path to V4L2 M2M encoder device. Default: auto select.\n");
+	SAY("    --encode-scale <scale>  ─────────────── Set output scaling for CPU encoder. Useful for 4K input.");
+	SAY("                                           Available: %s; default: native.", ENCODE_SCALE_STR);
+	SAY("                                             * native ──── Auto: downscale 4K NV12 to 1080p, others unchanged;");
+	SAY("                                             * 1080p ───── Force 1080p (1920x1080) output;");
+	SAY("                                             * 2k ────────  Force 2K (2560x1440) output.\n");
 	SAY("Image control options:");
 	SAY("══════════════════════");
 	SAY("    --image-default  ────────────────────── Reset all image settings below to default. Default: no change.\n");

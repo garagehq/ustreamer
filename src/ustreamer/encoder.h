@@ -33,6 +33,7 @@
 
 
 #define ENCODER_TYPES_STR "CPU, HW, M2M-VIDEO, M2M-IMAGE"
+#define ENCODE_SCALE_STR "native, 1080p, 2k"
 
 
 typedef enum {
@@ -41,6 +42,14 @@ typedef enum {
 	US_ENCODER_TYPE_M2M_VIDEO,
 	US_ENCODER_TYPE_M2M_IMAGE,
 } us_encoder_type_e;
+
+typedef enum {
+	US_ENCODE_SCALE_NATIVE = 0,  // Auto (4K NV12 -> 1080p, others native)
+	US_ENCODE_SCALE_1080P = 1,   // Force 1080p output
+	US_ENCODE_SCALE_2K = 2,      // Force 2K (1440p) output
+} us_encode_scale_e;
+
+extern us_encode_scale_e us_g_encode_scale;
 
 typedef struct {
 	us_encoder_type_e	type;
@@ -73,6 +82,8 @@ void us_encoder_destroy(us_encoder_s *enc);
 
 int us_encoder_parse_type(const char *str);
 const char *us_encoder_type_to_string(us_encoder_type_e type);
+int us_encoder_parse_scale(const char *str);
+const char *us_encoder_scale_to_string(us_encode_scale_e scale);
 
 void us_encoder_open(us_encoder_s *enc, us_capture_s *cap);
 void us_encoder_close(us_encoder_s *enc);

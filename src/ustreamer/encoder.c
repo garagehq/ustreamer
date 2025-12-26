@@ -43,6 +43,21 @@
 #include "encoders/hw/encoder.h"
 
 
+us_encode_scale_e us_g_encode_scale = US_ENCODE_SCALE_NATIVE;
+
+static const struct {
+	const char *name;
+	const us_encode_scale_e scale;
+} _ENCODE_SCALES[] = {
+	{"native",		US_ENCODE_SCALE_NATIVE},
+	{"auto",		US_ENCODE_SCALE_NATIVE},
+	{"1080p",		US_ENCODE_SCALE_1080P},
+	{"1080",		US_ENCODE_SCALE_1080P},
+	{"2k",			US_ENCODE_SCALE_2K},
+	{"1440p",		US_ENCODE_SCALE_2K},
+	{"1440",		US_ENCODE_SCALE_2K},
+};
+
 static const struct {
 	const char *name;
 	const us_encoder_type_e type; // cppcheck-suppress unusedStructMember
@@ -107,6 +122,24 @@ const char *us_encoder_type_to_string(us_encoder_type_e type) {
 		}
 	});
 	return _ENCODER_TYPES[0].name;
+}
+
+int us_encoder_parse_scale(const char *str) {
+	US_ARRAY_ITERATE(_ENCODE_SCALES, 0, item, {
+		if (!strcasecmp(item->name, str)) {
+			return item->scale;
+		}
+	});
+	return -1;
+}
+
+const char *us_encoder_scale_to_string(us_encode_scale_e scale) {
+	switch (scale) {
+		case US_ENCODE_SCALE_NATIVE: return "native";
+		case US_ENCODE_SCALE_1080P: return "1080p";
+		case US_ENCODE_SCALE_2K: return "2k";
+		default: return "native";
+	}
 }
 
 void us_encoder_open(us_encoder_s *enc, us_capture_s *cap) {
