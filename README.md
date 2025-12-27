@@ -1,6 +1,72 @@
-# µStreamer
+# µStreamer (GarageHQ Fork)
+
+> **This is a fork of [PiKVM's ustreamer](https://github.com/pikvm/ustreamer) with additional features for RK3588-based HDMI capture devices, specifically for the [StreamSentry](https://github.com/garagehq/StreamSentry) project.**
+
 [![CI](https://github.com/pikvm/ustreamer/workflows/CI/badge.svg)](https://github.com/pikvm/ustreamer/actions?query=workflow%3ACI)
 [![Discord](https://img.shields.io/discord/580094191938437144?logo=discord)](https://discord.gg/bpmXfz5)
+
+## Fork Additions
+
+### NV12/NV16/NV24 Format Support
+The RK3588 HDMI-RX driver outputs video in NV12 format (Y/UV 4:2:0), which the stock ustreamer doesn't support. This fork adds:
+- NV12, NV16, and NV24 pixel format support
+- YCbCr-direct JPEG encoding (no RGB conversion overhead)
+- Optimized scanline processing for NV formats
+
+### Flexible Resolution Scaling (`--encode-scale`)
+For high-resolution input (4K), CPU JPEG encoding can be a bottleneck. This fork adds:
+```bash
+--encode-scale native   # Auto: 4K NV12 → 1080p, others unchanged (default)
+--encode-scale 1080p    # Force 1080p output (1920x1080)
+--encode-scale 2k       # Force 2K output (2560x1440)
+```
+
+### Extended Timeouts & Retry Logic
+The RK3588 HDMI-RX driver can be slow to respond. This fork adds:
+- Extended device timeout (5s instead of 1s)
+- Retry logic (3 attempts) before device restart
+- Better error handling for multiplanar devices
+
+## Performance (4K HDMI Input)
+
+| Mode | FPS | Notes |
+|------|-----|-------|
+| Native 4K | ~4 fps | CPU bottleneck on JPEG encoding |
+| 2K (2560x1440) | ~9 fps | `--encode-scale 2k` |
+| 1080p (1920x1080) | ~13-30 fps | `--encode-scale 1080p` (default) |
+| Raw V4L2 capture | 52 fps | Hardware is capable |
+| MPP Hardware JPEG | ~18 fps | Future: mppjpegenc integration |
+
+## Usage with RK3588
+
+```bash
+# NV12 device at 4K with automatic 1080p downscaling
+ustreamer --device=/dev/video0 --format=NV12 --resolution=3840x2160 \
+    --encode-scale 1080p --quality=75 --workers=8 --buffers=8
+
+# BGR24 device (some HDMI capture cards)
+ustreamer --device=/dev/video0 --format=BGR24 --resolution=3840x2160 \
+    --quality=75 --workers=8 --buffers=8
+```
+
+## Supported Formats
+
+| V4L2 Format | ustreamer Flag | Notes |
+|-------------|----------------|-------|
+| NV12 | `--format=NV12` | RK3588 HDMI-RX native, YCbCr encoding |
+| NV16 | `--format=NV16` | 4:2:2 subsampling |
+| NV24 | `--format=NV24` | 4:4:4 no subsampling |
+| BGR3/BGR24 | `--format=BGR24` | Some HDMI devices |
+| RGB3/RGB24 | `--format=RGB24` | Standard RGB |
+| YUYV | `--format=YUYV` | Webcam-style |
+| UYVY | `--format=UYVY` | Alternate YUV |
+| MJPEG | `--format=MJPEG` | Pre-compressed |
+
+See [CLAUDE.md](CLAUDE.md) for detailed development notes.
+
+-----
+
+# Original µStreamer Documentation
 
 µStreamer is a lightweight and very quick server to stream [MJPEG](https://en.wikipedia.org/wiki/Motion_JPEG) video from any V4L2 device to the net. All new browsers have native support of this video format, as well as most video players such as mplayer, VLC etc.
 µStreamer is a part of the [PiKVM](https://github.com/pikvm/pikvm) project designed to stream [VGA](https://www.amazon.com/dp/B0126O0RDC) and [HDMI](https://auvidea.com/b101-hdmi-to-csi-2-bridge-15-pin-fpc/) screencast hardware data with the highest resolution and FPS possible.
