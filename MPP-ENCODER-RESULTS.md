@@ -57,6 +57,7 @@ Modified `src/Makefile`:
 2. **4 Workers Optimal**: More workers (8+) causes contention, decreasing performance
 3. **Downscaling Overhead**: CPU-based downscaling adds ~20% overhead at 2K
 4. **True 4K Performance**: 50 FPS at native 4K exceeds the 25 FPS target
+5. **Cache Sync Required**: `mpp_buffer_sync_end()` must be called after CPU writes to prevent DMA artifacts
 
 ## Usage Examples
 
