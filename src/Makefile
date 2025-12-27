@@ -87,6 +87,15 @@ ifneq ($(MK_WITH_PDEATHSIG),)
 override _CFLAGS += -DMK_WITH_PDEATHSIG -DWITH_PDEATHSIG
 endif
 
+# Auto-detect Rockchip MPP library
+_HAS_MPP := $(shell $(PKG_CONFIG) --exists rockchip_mpp 2>/dev/null && echo 1)
+ifeq ($(_HAS_MPP),1)
+override _CFLAGS += -DWITH_MPP $(shell $(PKG_CONFIG) --cflags rockchip_mpp)
+override _USTR_LDFLAGS += $(shell $(PKG_CONFIG) --libs rockchip_mpp)
+override _USTR_SRCS += $(shell ls ustreamer/encoders/mpp/*.c 2>/dev/null)
+$(info -- MPP hardware encoder support enabled)
+endif
+
 ifneq ($(MK_WITH_V4P),)
 override _TARGETS += $(_V4P)
 override _OBJS += $(_V4P_SRCS:%.c=$(_BUILD)/%.o)

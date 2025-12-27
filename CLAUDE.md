@@ -12,6 +12,16 @@ The RK3588 HDMI-RX driver outputs video in NV12 format (Y/UV 4:2:0), which the s
 - YCbCr-direct JPEG encoding (no RGB conversion overhead)
 - Optimized scanline processing for NV formats
 
+### MPP Hardware JPEG Encoding (`--encoder=mpp-jpeg`)
+The RK3588 has a dedicated VPU (Video Processing Unit) for hardware video encoding. This fork integrates the Rockchip MPP (Media Process Platform) library for hardware-accelerated JPEG encoding:
+```bash
+--encoder=mpp-jpeg    # Use RK3588 VPU for JPEG encoding
+```
+- Uses `/dev/mpp_service` hardware encoder
+- Supports NV12, NV16, NV24, YUYV, UYVY, RGB24, BGR24 input formats
+- Significantly faster than CPU encoding for high resolutions
+- Auto-detected at build time when `librockchip-mpp-dev` is installed
+
 ### Flexible Resolution Scaling (`--encode-scale`)
 For high-resolution input (4K), CPU JPEG encoding can be a bottleneck. This fork adds:
 ```bash
@@ -28,15 +38,16 @@ The RK3588 HDMI-RX driver can be slow to respond. This fork adds:
 
 ## Performance (4K HDMI Input)
 
-| Mode | FPS | Notes |
-|------|-----|-------|
-| Native 4K | ~4 fps | CPU bottleneck on JPEG encoding |
-| 2K (2560x1440) | ~9 fps | `--encode-scale 2k` |
-| 1080p (1920x1080) | ~13-30 fps | `--encode-scale 1080p` (default) |
-| Raw V4L2 capture | 52 fps | Hardware is capable |
-| MPP Hardware JPEG | ~18 fps | Future: mppjpegenc integration |
+| Mode | Encoder | FPS | Notes |
+|------|---------|-----|-------|
+| Native 4K | CPU | ~4 fps | CPU bottleneck on JPEG encoding |
+| 2K (2560x1440) | CPU | ~9-15 fps | `--encode-scale 2k` |
+| 1080p | CPU | ~15-30 fps | `--encode-scale 1080p` |
+| 2K | **MPP-JPEG** | ~30 fps | `--encoder=mpp-jpeg` (target) |
+| 4K | **MPP-JPEG** | ~15-20 fps | `--encoder=mpp-jpeg` (target) |
+| Raw V4L2 capture | N/A | 52 fps | Hardware capture capability |
 
-The bottleneck is CPU JPEG compression, not V4L2 capture. The RK3588 has hardware JPEG encoding via MPP (`mppjpegenc`) that could achieve ~18 FPS at 2K, but integrating it requires significant changes.
+The bottleneck with CPU encoding is JPEG compression. The MPP hardware encoder bypasses this by using the RK3588's dedicated VPU.
 
 ## Modified Files
 
@@ -48,6 +59,14 @@ The bottleneck is CPU JPEG compression, not V4L2 capture. The RK3588 has hardwar
 ### JPEG Encoding
 - `src/ustreamer/encoders/cpu/encoder.c` - NV12/NV16/NV24 YCbCr encoding, flexible downscaling
 
+### MPP Hardware Encoding (NEW)
+- `src/ustreamer/encoders/mpp/encoder.h` - MPP encoder interface
+- `src/ustreamer/encoders/mpp/encoder.c` - Rockchip MPP JPEG encoder implementation
+- `src/ustreamer/encoder.c` - MPP encoder type and worker integration
+- `src/ustreamer/encoder.h` - `US_ENCODER_TYPE_MPP_IMAGE` enum
+- `src/ustreamer/options.c` - `--encoder=mpp-jpeg` CLI option
+- `src/Makefile` - Auto-detect and link `librockchip_mpp`
+
 ### Resolution Scaling
 - `src/ustreamer/encoder.c` - Global encode scale setting, scale parsing functions
 - `src/ustreamer/encoder.h` - Encode scale enum and extern declaration
@@ -58,11 +77,17 @@ The bottleneck is CPU JPEG compression, not V4L2 capture. The RK3588 has hardwar
 ```bash
 git clone https://github.com/garagehq/ustreamer.git
 cd ustreamer
+
+# Install MPP development library (for hardware encoding support)
+sudo apt install librockchip-mpp-dev
+
 make -j$(nproc)
 
 # Install
 sudo cp ustreamer /usr/local/bin/ustreamer-patched
 ```
+
+The build system auto-detects `librockchip-mpp-dev` and enables MPP hardware encoding if available. You'll see "MPP hardware encoder support enabled" during build.
 
 ## Usage with StreamSentry
 
@@ -72,7 +97,11 @@ StreamSentry automatically:
 3. Uses `--encode-scale native` for automatic 4K→1080p downscaling
 
 ```bash
-# Manual usage for NV12 device at 4K
+# Hardware encoding with MPP (recommended for RK3588)
+ustreamer-patched --device=/dev/video0 --format=NV12 --resolution=3840x2160 \
+    --encoder=mpp-jpeg --quality=80 --buffers=4
+
+# CPU encoding with downscaling (fallback)
 ustreamer-patched --device=/dev/video0 --format=NV12 --resolution=3840x2160 \
     --encode-scale 1080p --quality=75 --workers=8 --buffers=8
 
@@ -122,9 +151,11 @@ Then use the matching `--format` flag.
 
 ## Future Improvements
 
-- **MPP Hardware JPEG encoding**: The RK3588 has hardware JPEG encoding via MPP that could achieve ~18 FPS at 2K. The `mppjpegenc` GStreamer element is available but integrating it into ustreamer requires significant refactoring.
+- ~~**MPP Hardware JPEG encoding**~~: **DONE** - Integrated via `--encoder=mpp-jpeg`. Uses Rockchip MPP library directly.
 
 - **Dynamic format switching**: Currently format is set at startup. Could add runtime format detection when HDMI source changes.
+
+- **MPP H.264/H.265 streaming**: The RK3588 VPU also supports H.264/H.265 encoding which could enable efficient video streaming for WebRTC/Janus integration.
 
 ## License
 

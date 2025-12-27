@@ -30,9 +30,14 @@
 
 #include "workers.h"
 #include "m2m.h"
+#include "encoders/mpp/encoder.h"
 
 
+#ifdef WITH_MPP
+#define ENCODER_TYPES_STR "CPU, HW, M2M-VIDEO, M2M-IMAGE, MPP-JPEG"
+#else
 #define ENCODER_TYPES_STR "CPU, HW, M2M-VIDEO, M2M-IMAGE"
+#endif
 #define ENCODE_SCALE_STR "native, 1080p, 2k"
 
 
@@ -41,6 +46,7 @@ typedef enum {
 	US_ENCODER_TYPE_HW,
 	US_ENCODER_TYPE_M2M_VIDEO,
 	US_ENCODER_TYPE_M2M_IMAGE,
+	US_ENCODER_TYPE_MPP_IMAGE,
 } us_encoder_type_e;
 
 typedef enum {
@@ -58,6 +64,11 @@ typedef struct {
 
 	uint				n_m2ms;
 	us_m2m_encoder_s	**m2ms;
+
+#ifdef WITH_MPP
+	uint				n_mpps;
+	us_mpp_encoder_s	**mpps;
+#endif
 
 	us_workers_pool_s	*pool;
 } us_encoder_runtime_s;

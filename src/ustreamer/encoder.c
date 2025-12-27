@@ -41,6 +41,7 @@
 
 #include "encoders/cpu/encoder.h"
 #include "encoders/hw/encoder.h"
+#include "encoders/mpp/encoder.h"
 
 
 us_encode_scale_e us_g_encode_scale = US_ENCODE_SCALE_NATIVE;
@@ -70,6 +71,11 @@ static const struct {
 	{"M2M-JPEG",	US_ENCODER_TYPE_M2M_IMAGE},
 	{"OMX",			US_ENCODER_TYPE_M2M_IMAGE},
 	{"NOOP",		US_ENCODER_TYPE_CPU},
+#ifdef WITH_MPP
+	{"MPP-JPEG",	US_ENCODER_TYPE_MPP_IMAGE},
+	{"MPP-IMAGE",	US_ENCODER_TYPE_MPP_IMAGE},
+	{"MPP",			US_ENCODER_TYPE_MPP_IMAGE},
+#endif
 };
 
 
@@ -101,6 +107,14 @@ void us_encoder_destroy(us_encoder_s *enc) {
 		}
 		free(run->m2ms);
 	}
+#ifdef WITH_MPP
+	if (run->mpps != NULL) {
+		for (uint index = 0; index < run->n_mpps; ++index) {
+			US_DELETE(run->mpps[index], us_mpp_encoder_destroy);
+		}
+		free(run->mpps);
+	}
+#endif
 	US_MUTEX_DESTROY(run->mutex);
 	free(run);
 	free(enc);
@@ -182,6 +196,20 @@ void us_encoder_open(us_encoder_s *enc, us_capture_s *cap) {
 				run->m2ms[run->n_m2ms] = us_m2m_jpeg_encoder_init(name, enc->m2m_path, quality);
 			}
 		}
+#ifdef WITH_MPP
+	} else if (type == US_ENCODER_TYPE_MPP_IMAGE) {
+		US_LOG_DEBUG("Preparing MPP-JPEG encoder ...");
+		// MPP encoder uses single instance since it's hardware-accelerated
+		n_workers = 1;
+		if (run->mpps == NULL) {
+			US_CALLOC(run->mpps, n_workers);
+		}
+		for (; run->n_mpps < n_workers; ++run->n_mpps) {
+			char name[32];
+			US_SNPRINTF(name, 31, "MPP-%u", run->n_mpps);
+			run->mpps[run->n_mpps] = us_mpp_jpeg_encoder_init(name, quality);
+		}
+#endif
 	}
 
 	if (quality == 0) {
@@ -257,6 +285,15 @@ static bool _worker_run_job(us_worker_s *wr) {
 		if (us_m2m_encoder_compress(run->m2ms[wr->number], src, dest, false) < 0) {
 			goto error;
 		}
+
+#ifdef WITH_MPP
+	} else if (run->type == US_ENCODER_TYPE_MPP_IMAGE) {
+		US_LOG_VERBOSE("Compressing JPEG using MPP: worker=%s, buffer=%u",
+			wr->name, job->hw->buf.index);
+		if (us_mpp_encoder_compress(run->mpps[wr->number], src, dest) < 0) {
+			goto error;
+		}
+#endif
 
 	} else {
 		assert(0 && "Unknown encoder type");
