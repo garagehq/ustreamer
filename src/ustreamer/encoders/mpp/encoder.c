@@ -60,6 +60,8 @@ static void _mpp_encoder_cleanup(us_mpp_encoder_s *enc);
 static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, uint width, uint height, uint format);
 static MppFrameFormat _v4l2_to_mpp_format(uint v4l2_format);
 static void _get_target_resolution(const us_frame_s *src, uint *target_width, uint *target_height);
+static void _copy_nv12_aligned(const u8 *src_data, uint src_width, uint src_height,
+                               u8 *dst_data, uint dst_hor_stride, uint dst_ver_stride);
 static void _downscale_nv12(const u8 *src_data, uint src_width, uint src_height,
                             u8 *dst_data, uint dst_width, uint dst_height);
 
@@ -132,14 +134,22 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 		return -1;
 	}
 
+	// Clear buffer to avoid artifacts from padding areas
+	size_t buf_size = mpp_buffer_get_size(enc->frame_buf);
+	memset(buf_ptr, 0, buf_size);
+
 	if (needs_downscale && src->format == V4L2_PIX_FMT_NV12) {
 		// Downscale NV12 frame to target resolution
 		_downscale_nv12(src->data, src->width, src->height,
 		                buf_ptr, target_width, target_height);
+	} else if (src->format == V4L2_PIX_FMT_NV12) {
+		// Copy NV12 with proper stride alignment for MPP
+		// Source has packed strides, MPP needs aligned strides
+		_copy_nv12_aligned(src->data, src->width, src->height,
+		                   buf_ptr, enc->hor_stride, enc->ver_stride);
 	} else {
-		// Direct copy
+		// Direct copy for other formats
 		size_t copy_size = src->used;
-		size_t buf_size = mpp_buffer_get_size(enc->frame_buf);
 		if (copy_size > buf_size) {
 			_LOG_ERROR("Frame size %zu exceeds buffer size %zu", copy_size, buf_size);
 			mpp_frame_deinit(&mpp_frame);
@@ -147,6 +157,11 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 		}
 		memcpy(buf_ptr, src->data, copy_size);
 	}
+
+	// Sync buffer to device (flush CPU cache for DMA access)
+	// This is critical - without it, MPP may read stale data causing artifacts
+	mpp_buffer_sync_end(enc->frame_buf);
+
 	mpp_frame_set_buffer(mpp_frame, enc->frame_buf);
 
 	// Encode
@@ -389,6 +404,41 @@ static MppFrameFormat _v4l2_to_mpp_format(uint v4l2_format) {
 			return MPP_FMT_BGR888;
 		default:
 			return MPP_FMT_BUTT;  // Unsupported
+	}
+}
+
+static void _copy_nv12_aligned(const u8 *src_data, uint src_width, uint src_height,
+                               u8 *dst_data, uint dst_hor_stride, uint dst_ver_stride) {
+	// Copy NV12 from packed source to stride-aligned destination
+	// NV12: Y plane followed by interleaved UV plane (half height)
+
+	const u8 *src_y = src_data;
+	const u8 *src_uv = src_data + (src_width * src_height);
+
+	u8 *dst_y = dst_data;
+	u8 *dst_uv = dst_data + (dst_hor_stride * dst_ver_stride);
+
+	// Copy Y plane row by row (handles stride difference)
+	if (src_width == dst_hor_stride) {
+		// Fast path: strides match, copy entire Y plane
+		memcpy(dst_y, src_y, src_width * src_height);
+	} else {
+		// Copy row by row with stride adjustment
+		for (uint y = 0; y < src_height; y++) {
+			memcpy(dst_y + y * dst_hor_stride, src_y + y * src_width, src_width);
+		}
+	}
+
+	// Copy UV plane (half height)
+	uint uv_height = src_height / 2;
+	if (src_width == dst_hor_stride) {
+		// Fast path: strides match
+		memcpy(dst_uv, src_uv, src_width * uv_height);
+	} else {
+		// Copy row by row with stride adjustment
+		for (uint y = 0; y < uv_height; y++) {
+			memcpy(dst_uv + y * dst_hor_stride, src_uv + y * src_width, src_width);
+		}
 	}
 }
 
