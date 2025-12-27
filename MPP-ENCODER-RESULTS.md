@@ -82,8 +82,30 @@ ustreamer --device=/dev/video0 --format=NV12 --resolution=3840x2160 \
 
 | Goal | Target | Achieved |
 |------|--------|----------|
-| 4K with VPU | 25+ FPS | **50 FPS** ✅ |
+| 4K with VPU | 25+ FPS | **50-54 FPS** ✅ |
 | 2K with VPU | 30 FPS | **28 FPS** ✅ |
+
+## StreamSentry Integration Test
+
+Successfully integrated into StreamSentry with the following ustreamer configuration:
+
+```bash
+/home/radxa/ustreamer-patched \
+    --device=/dev/video0 \
+    --format=NV12 \
+    --resolution=3840x2160 \
+    --encoder=mpp-jpeg \
+    --encode-scale=4k \
+    --quality=80 \
+    --workers=4 \
+    --buffers=5
+```
+
+**Results:**
+- Source capture: 3840x2160 @ 60 FPS
+- Stream output: 54 FPS
+- Encoder type: MPP-JPEG (hardware)
+- Display pipeline: 30 FPS with instant ad blocking
 
 ## Files Modified
 
