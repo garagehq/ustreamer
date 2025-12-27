@@ -43,6 +43,8 @@
 #include "../../../libs/logging.h"
 #include "../../../libs/frame.h"
 
+#include "../../encoder.h"  // For us_g_encode_scale
+
 
 #define _LOG_ERROR(x_msg, ...)   US_LOG_ERROR("MPP %s: " x_msg, enc->name, ##__VA_ARGS__)
 #define _LOG_PERROR(x_msg, ...)  US_LOG_PERROR("MPP %s: " x_msg, enc->name, ##__VA_ARGS__)
@@ -55,8 +57,11 @@
 
 
 static void _mpp_encoder_cleanup(us_mpp_encoder_s *enc);
-static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, const us_frame_s *frame);
+static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, uint width, uint height, uint format);
 static MppFrameFormat _v4l2_to_mpp_format(uint v4l2_format);
+static void _get_target_resolution(const us_frame_s *src, uint *target_width, uint *target_height);
+static void _downscale_nv12(const u8 *src_data, uint src_width, uint src_height,
+                            u8 *dst_data, uint dst_width, uint dst_height);
 
 
 us_mpp_encoder_s *us_mpp_jpeg_encoder_init(const char *name, uint quality) {
@@ -85,8 +90,13 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 
 	us_frame_encoding_begin(src, dest, V4L2_PIX_FMT_JPEG);
 
-	// Ensure encoder is configured for this frame
-	if (_mpp_encoder_prepare(enc, src) < 0) {
+	// Determine target resolution based on encode scale setting
+	uint target_width, target_height;
+	_get_target_resolution(src, &target_width, &target_height);
+	bool needs_downscale = (target_width != src->width || target_height != src->height);
+
+	// Ensure encoder is configured for target dimensions
+	if (_mpp_encoder_prepare(enc, target_width, target_height, src->format) < 0) {
 		_LOG_ERROR("Failed to prepare encoder");
 		return -1;
 	}
@@ -96,7 +106,7 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 		return -1;
 	}
 
-	_LOG_DEBUG("Compressing frame %ux%u ...", src->width, src->height);
+	_LOG_DEBUG("Compressing frame %ux%u -> %ux%u ...", src->width, src->height, target_width, target_height);
 
 	// Create input frame
 	MppFrame mpp_frame = NULL;
@@ -114,7 +124,7 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 	mpp_frame_set_fmt(mpp_frame, enc->mpp_format);
 	mpp_frame_set_eos(mpp_frame, 0);
 
-	// Copy frame data to MPP buffer
+	// Copy frame data to MPP buffer (with optional downscaling)
 	void *buf_ptr = mpp_buffer_get_ptr(enc->frame_buf);
 	if (buf_ptr == NULL) {
 		_LOG_ERROR("Failed to get buffer pointer");
@@ -122,16 +132,21 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 		return -1;
 	}
 
-	// Calculate proper copy sizes based on format
-	size_t copy_size = src->used;
-	size_t buf_size = mpp_buffer_get_size(enc->frame_buf);
-	if (copy_size > buf_size) {
-		_LOG_ERROR("Frame size %zu exceeds buffer size %zu", copy_size, buf_size);
-		mpp_frame_deinit(&mpp_frame);
-		return -1;
+	if (needs_downscale && src->format == V4L2_PIX_FMT_NV12) {
+		// Downscale NV12 frame to target resolution
+		_downscale_nv12(src->data, src->width, src->height,
+		                buf_ptr, target_width, target_height);
+	} else {
+		// Direct copy
+		size_t copy_size = src->used;
+		size_t buf_size = mpp_buffer_get_size(enc->frame_buf);
+		if (copy_size > buf_size) {
+			_LOG_ERROR("Frame size %zu exceeds buffer size %zu", copy_size, buf_size);
+			mpp_frame_deinit(&mpp_frame);
+			return -1;
+		}
+		memcpy(buf_ptr, src->data, copy_size);
 	}
-
-	memcpy(buf_ptr, src->data, copy_size);
 	mpp_frame_set_buffer(mpp_frame, enc->frame_buf);
 
 	// Encode
@@ -183,24 +198,24 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 	return 0;
 }
 
-static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, const us_frame_s *frame) {
-	MppFrameFormat mpp_format = _v4l2_to_mpp_format(frame->format);
+static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, uint width, uint height, uint format) {
+	MppFrameFormat mpp_format = _v4l2_to_mpp_format(format);
 
 	if (mpp_format == MPP_FMT_BUTT) {
-		_LOG_ERROR("Unsupported input format: 0x%08x", frame->format);
+		_LOG_ERROR("Unsupported input format: 0x%08x", format);
 		return -1;
 	}
 
 	// Check if reconfiguration is needed
 	if (enc->ready &&
-		enc->width == frame->width &&
-		enc->height == frame->height &&
+		enc->width == width &&
+		enc->height == height &&
 		enc->mpp_format == mpp_format) {
 		return 0;  // Already configured
 	}
 
 	_LOG_INFO("Configuring encoder for %ux%u format=0x%08x ...",
-		frame->width, frame->height, frame->format);
+		width, height, format);
 
 	// Cleanup existing configuration
 	_mpp_encoder_cleanup(enc);
@@ -208,13 +223,13 @@ static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, const us_frame_s *frame) 
 	MPP_RET ret;
 
 	// Store configuration
-	enc->width = frame->width;
-	enc->height = frame->height;
+	enc->width = width;
+	enc->height = height;
 	enc->mpp_format = mpp_format;
 
 	// Calculate strides (16-byte aligned for MPP)
-	enc->hor_stride = MPP_ALIGN(frame->width, 16);
-	enc->ver_stride = MPP_ALIGN(frame->height, 16);
+	enc->hor_stride = MPP_ALIGN(width, 16);
+	enc->ver_stride = MPP_ALIGN(height, 16);
 
 	// Create MPP context
 	ret = mpp_create(&enc->mpp_ctx, &enc->mpi);
@@ -374,6 +389,95 @@ static MppFrameFormat _v4l2_to_mpp_format(uint v4l2_format) {
 			return MPP_FMT_BGR888;
 		default:
 			return MPP_FMT_BUTT;  // Unsupported
+	}
+}
+
+static void _get_target_resolution(const us_frame_s *src, uint *target_width, uint *target_height) {
+	// Check the global encode scale setting
+	switch (us_g_encode_scale) {
+		case US_ENCODE_SCALE_1080P:
+			*target_width = 1920;
+			*target_height = 1080;
+			break;
+		case US_ENCODE_SCALE_2K:
+			*target_width = 2560;
+			*target_height = 1440;
+			break;
+		case US_ENCODE_SCALE_4K:
+			// Force 4K output (no downscaling)
+			*target_width = src->width;
+			*target_height = src->height;
+			break;
+		case US_ENCODE_SCALE_NATIVE:
+		default:
+			// Native mode: auto-downscale 4K NV12 to 1080p
+			if (src->width >= 3840 && src->height >= 2160 && src->format == V4L2_PIX_FMT_NV12) {
+				*target_width = 1920;
+				*target_height = 1080;
+			} else {
+				*target_width = src->width;
+				*target_height = src->height;
+			}
+			break;
+	}
+
+	// Ensure dimensions don't exceed source
+	if (*target_width > src->width) {
+		*target_width = src->width;
+	}
+	if (*target_height > src->height) {
+		*target_height = src->height;
+	}
+}
+
+static void _downscale_nv12(const u8 *src_data, uint src_width, uint src_height,
+                            u8 *dst_data, uint dst_width, uint dst_height) {
+	// Ultra-fast NV12 downscaler using nearest-neighbor sampling
+	// NV12: Y plane followed by interleaved UV plane (half height)
+
+	const uint dst_y_stride = MPP_ALIGN(dst_width, 16);
+	const uint dst_uv_stride = dst_y_stride;
+
+	// Fixed-point scale factors (16.16 format)
+	const uint scale_x_fp = (src_width << 16) / dst_width;
+	const uint scale_y_fp = (src_height << 16) / dst_height;
+
+	// Source plane pointers
+	const u8 *src_y = src_data;
+	const u8 *src_uv = src_data + (src_width * src_height);
+
+	// Destination plane pointers (MPP buffer with aligned strides)
+	u8 *dst_y = dst_data;
+	u8 *dst_uv = dst_data + (dst_y_stride * MPP_ALIGN(dst_height, 16));
+
+	// Downscale Y plane using nearest-neighbor
+	for (uint dy = 0; dy < dst_height; dy++) {
+		const uint sy = (dy * scale_y_fp) >> 16;
+		const u8 *src_row = src_y + sy * src_width;
+		u8 *dst_row = dst_y + dy * dst_y_stride;
+
+		for (uint dx = 0; dx < dst_width; dx++) {
+			const uint sx = (dx * scale_x_fp) >> 16;
+			dst_row[dx] = src_row[sx];
+		}
+	}
+
+	// Downscale UV plane (interleaved U/V pairs, half height in source)
+	const uint src_uv_height = src_height / 2;
+	const uint dst_uv_height = dst_height / 2;
+	const uint scale_uv_y_fp = (src_uv_height << 16) / dst_uv_height;
+
+	for (uint dy = 0; dy < dst_uv_height; dy++) {
+		const uint sy = (dy * scale_uv_y_fp) >> 16;
+		const u8 *src_row = src_uv + sy * src_width;
+		u8 *dst_row = dst_uv + dy * dst_uv_stride;
+
+		// Process UV pairs
+		for (uint dx = 0; dx < dst_width; dx += 2) {
+			const uint sx = ((dx * scale_x_fp) >> 16) & ~1;  // Align to UV pair
+			dst_row[dx] = src_row[sx];
+			dst_row[dx + 1] = src_row[sx + 1];
+		}
 	}
 }
 

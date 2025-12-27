@@ -57,6 +57,9 @@ static const struct {
 	{"2k",			US_ENCODE_SCALE_2K},
 	{"1440p",		US_ENCODE_SCALE_2K},
 	{"1440",		US_ENCODE_SCALE_2K},
+	{"4k",			US_ENCODE_SCALE_4K},
+	{"2160p",		US_ENCODE_SCALE_4K},
+	{"2160",		US_ENCODE_SCALE_4K},
 };
 
 static const struct {
@@ -152,6 +155,7 @@ const char *us_encoder_scale_to_string(us_encode_scale_e scale) {
 		case US_ENCODE_SCALE_NATIVE: return "native";
 		case US_ENCODE_SCALE_1080P: return "1080p";
 		case US_ENCODE_SCALE_2K: return "2k";
+		case US_ENCODE_SCALE_4K: return "4k";
 		default: return "native";
 	}
 }
@@ -199,8 +203,7 @@ void us_encoder_open(us_encoder_s *enc, us_capture_s *cap) {
 #ifdef WITH_MPP
 	} else if (type == US_ENCODER_TYPE_MPP_IMAGE) {
 		US_LOG_DEBUG("Preparing MPP-JPEG encoder ...");
-		// MPP encoder uses single instance since it's hardware-accelerated
-		n_workers = 1;
+		// Try multiple MPP instances - RK3588 may support parallel encoding
 		if (run->mpps == NULL) {
 			US_CALLOC(run->mpps, n_workers);
 		}

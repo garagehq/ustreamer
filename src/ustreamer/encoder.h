@@ -38,7 +38,7 @@
 #else
 #define ENCODER_TYPES_STR "CPU, HW, M2M-VIDEO, M2M-IMAGE"
 #endif
-#define ENCODE_SCALE_STR "native, 1080p, 2k"
+#define ENCODE_SCALE_STR "native, 1080p, 2k, 4k"
 
 
 typedef enum {
@@ -53,6 +53,7 @@ typedef enum {
 	US_ENCODE_SCALE_NATIVE = 0,  // Auto (4K NV12 -> 1080p, others native)
 	US_ENCODE_SCALE_1080P = 1,   // Force 1080p output
 	US_ENCODE_SCALE_2K = 2,      // Force 2K (1440p) output
+	US_ENCODE_SCALE_4K = 3,      // Force 4K output (no downscaling)
 } us_encode_scale_e;
 
 extern us_encode_scale_e us_g_encode_scale;

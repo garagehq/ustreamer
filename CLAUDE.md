@@ -28,6 +28,7 @@ For high-resolution input (4K), CPU JPEG encoding can be a bottleneck. This fork
 --encode-scale native   # Auto: 4K NV12 → 1080p, others unchanged (default)
 --encode-scale 1080p    # Force 1080p output (1920x1080)
 --encode-scale 2k       # Force 2K output (2560x1440)
+--encode-scale 4k       # Force 4K output (no downscaling)
 ```
 
 ### Extended Timeouts & Retry Logic
@@ -38,16 +39,17 @@ The RK3588 HDMI-RX driver can be slow to respond. This fork adds:
 
 ## Performance (4K HDMI Input)
 
-| Mode | Encoder | FPS | Notes |
-|------|---------|-----|-------|
-| Native 4K | CPU | ~4 fps | CPU bottleneck on JPEG encoding |
-| 2K (2560x1440) | CPU | ~9-15 fps | `--encode-scale 2k` |
-| 1080p | CPU | ~15-30 fps | `--encode-scale 1080p` |
-| 2K | **MPP-JPEG** | ~30 fps | `--encoder=mpp-jpeg` (target) |
-| 4K | **MPP-JPEG** | ~15-20 fps | `--encoder=mpp-jpeg` (target) |
-| Raw V4L2 capture | N/A | 52 fps | Hardware capture capability |
+| Mode | Encoder | Workers | FPS | Notes |
+|------|---------|---------|-----|-------|
+| Native 4K | CPU | 1 | ~4 fps | CPU bottleneck on JPEG encoding |
+| 2K (2560x1440) | CPU | 8 | ~9-15 fps | `--encode-scale 2k` |
+| 1080p | CPU | 8 | ~15-30 fps | `--encode-scale 1080p` |
+| **4K** | **MPP-JPEG** | 4 | **~50 fps** | `--encoder=mpp-jpeg --encode-scale=4k` |
+| **2K** | **MPP-JPEG** | 4 | **~28 fps** | `--encoder=mpp-jpeg --encode-scale=2k` |
+| **1080p** | **MPP-JPEG** | 4 | **~55 fps** | `--encoder=mpp-jpeg` (native auto-downscale) |
+| Raw V4L2 capture | N/A | - | 52 fps | Hardware capture capability |
 
-The bottleneck with CPU encoding is JPEG compression. The MPP hardware encoder bypasses this by using the RK3588's dedicated VPU.
+The bottleneck with CPU encoding is JPEG compression. The MPP hardware encoder bypasses this by using the RK3588's dedicated VPU. Using 4 workers allows parallel encoding across multiple MPP encoder instances.
 
 ## Modified Files
 
@@ -97,11 +99,19 @@ StreamSentry automatically:
 3. Uses `--encode-scale native` for automatic 4K→1080p downscaling
 
 ```bash
-# Hardware encoding with MPP (recommended for RK3588)
+# Hardware encoding at 4K (~50 FPS)
 ustreamer-patched --device=/dev/video0 --format=NV12 --resolution=3840x2160 \
-    --encoder=mpp-jpeg --quality=80 --buffers=4
+    --encoder=mpp-jpeg --encode-scale=4k --quality=80 --workers=4
 
-# CPU encoding with downscaling (fallback)
+# Hardware encoding at 2K (~28 FPS)
+ustreamer-patched --device=/dev/video0 --format=NV12 --resolution=3840x2160 \
+    --encoder=mpp-jpeg --encode-scale=2k --quality=80 --workers=4
+
+# Hardware encoding with auto-downscale (~55 FPS at 1080p)
+ustreamer-patched --device=/dev/video0 --format=NV12 --resolution=3840x2160 \
+    --encoder=mpp-jpeg --quality=80 --workers=4
+
+# CPU encoding with downscaling (fallback if no MPP)
 ustreamer-patched --device=/dev/video0 --format=NV12 --resolution=3840x2160 \
     --encode-scale 1080p --quality=75 --workers=8 --buffers=8
 
