@@ -7,6 +7,16 @@
 
 ## Fork Additions
 
+### MPP Hardware JPEG Encoding (`--encoder=mpp-jpeg`)
+The RK3588 has a dedicated VPU for hardware video encoding. This fork integrates the Rockchip MPP library:
+```bash
+--encoder=mpp-jpeg    # Use RK3588 VPU for JPEG encoding
+```
+- **50+ FPS at 4K** using hardware acceleration
+- Supports NV12, NV16, NV24, YUYV, UYVY, RGB24, BGR24 input formats
+- Multi-worker support (4 parallel MPP encoders recommended)
+- Auto-detected at build time when `librockchip-mpp-dev` is installed
+
 ### NV12/NV16/NV24 Format Support
 The RK3588 HDMI-RX driver outputs video in NV12 format (Y/UV 4:2:0), which the stock ustreamer doesn't support. This fork adds:
 - NV12, NV16, and NV24 pixel format support
@@ -14,11 +24,12 @@ The RK3588 HDMI-RX driver outputs video in NV12 format (Y/UV 4:2:0), which the s
 - Optimized scanline processing for NV formats
 
 ### Flexible Resolution Scaling (`--encode-scale`)
-For high-resolution input (4K), CPU JPEG encoding can be a bottleneck. This fork adds:
+For high-resolution input (4K), this fork adds output resolution control:
 ```bash
 --encode-scale native   # Auto: 4K NV12 → 1080p, others unchanged (default)
 --encode-scale 1080p    # Force 1080p output (1920x1080)
 --encode-scale 2k       # Force 2K output (2560x1440)
+--encode-scale 4k       # Force 4K output (no downscaling)
 ```
 
 ### Extended Timeouts & Retry Logic
@@ -29,24 +40,33 @@ The RK3588 HDMI-RX driver can be slow to respond. This fork adds:
 
 ## Performance (4K HDMI Input)
 
-| Mode | FPS | Notes |
-|------|-----|-------|
-| Native 4K | ~4 fps | CPU bottleneck on JPEG encoding |
-| 2K (2560x1440) | ~9 fps | `--encode-scale 2k` |
-| 1080p (1920x1080) | ~13-30 fps | `--encode-scale 1080p` (default) |
-| Raw V4L2 capture | 52 fps | Hardware is capable |
-| MPP Hardware JPEG | ~18 fps | Future: mppjpegenc integration |
+| Mode | Encoder | Workers | FPS | Notes |
+|------|---------|---------|-----|-------|
+| **4K Native** | **MPP-JPEG** | 4 | **~50-60** | Hardware VPU encoding |
+| **2K (2560x1440)** | **MPP-JPEG** | 4 | **~28** | `--encode-scale=2k` |
+| **1080p** | **MPP-JPEG** | 4 | **~55** | `--encode-scale=1080p` |
+| 4K Native | CPU | 1 | ~4 | CPU bottleneck |
+| 1080p | CPU | 8 | ~15-30 | `--encode-scale=1080p` |
+| Raw V4L2 capture | N/A | - | 60 | Hardware capability |
 
 ## Usage with RK3588
 
 ```bash
-# NV12 device at 4K with automatic 1080p downscaling
+# MPP Hardware encoding at 4K (~50-60 FPS) - RECOMMENDED
 ustreamer --device=/dev/video0 --format=NV12 --resolution=3840x2160 \
-    --encode-scale 1080p --quality=75 --workers=8 --buffers=8
+    --encoder=mpp-jpeg --encode-scale=4k --quality=80 --workers=4
+
+# MPP Hardware encoding at 2K (~28 FPS)
+ustreamer --device=/dev/video0 --format=NV12 --resolution=3840x2160 \
+    --encoder=mpp-jpeg --encode-scale=2k --quality=80 --workers=4
+
+# CPU encoding fallback (if no MPP library)
+ustreamer --device=/dev/video0 --format=NV12 --resolution=3840x2160 \
+    --encode-scale=1080p --quality=75 --workers=8 --buffers=8
 
 # BGR24 device (some HDMI capture cards)
 ustreamer --device=/dev/video0 --format=BGR24 --resolution=3840x2160 \
-    --quality=75 --workers=8 --buffers=8
+    --encoder=mpp-jpeg --quality=80 --workers=4
 ```
 
 ## Supported Formats

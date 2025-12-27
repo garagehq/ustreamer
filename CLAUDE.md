@@ -21,6 +21,8 @@ The RK3588 has a dedicated VPU (Video Processing Unit) for hardware video encodi
 - Supports NV12, NV16, NV24, YUYV, UYVY, RGB24, BGR24 input formats
 - Significantly faster than CPU encoding for high resolutions
 - Auto-detected at build time when `librockchip-mpp-dev` is installed
+- Multi-worker support: 4 parallel MPP encoder instances for maximum throughput
+- Cache coherency handled via `mpp_buffer_sync_end()` to prevent DMA artifacts
 
 ### Flexible Resolution Scaling (`--encode-scale`)
 For high-resolution input (4K), CPU JPEG encoding can be a bottleneck. This fork adds:
@@ -158,6 +160,9 @@ v4l2-ctl -d /dev/video0 --get-fmt-video
 ```
 
 Then use the matching `--format` flag.
+
+### Green horizontal line artifacts (MPP encoder)
+If you see intermittent horizontal green/cyan lines in encoded frames, this is caused by CPU cache not being flushed before MPP's DMA engine reads the buffer. The fix requires calling `mpp_buffer_sync_end()` after copying frame data to the MPP buffer. This is already implemented in the current codebase.
 
 ## Future Improvements
 
