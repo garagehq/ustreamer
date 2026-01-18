@@ -86,9 +86,9 @@ ustreamer --device=/dev/video0 --format=NV12 --resolution=3840x2160 \
 | 4K with VPU | 25+ FPS | **50-54 FPS** ✅ |
 | 2K with VPU | 30 FPS | **28 FPS** ✅ |
 
-## StreamSentry Integration Test
+## Minus Integration Test
 
-Successfully integrated into StreamSentry with the following ustreamer configuration:
+Successfully integrated into Minus with the following ustreamer configuration:
 
 ```bash
 /home/radxa/ustreamer-patched \

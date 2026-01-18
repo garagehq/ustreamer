@@ -2,7 +2,7 @@
 
 ## Overview
 
-This is a fork of [PiKVM's ustreamer](https://github.com/pikvm/ustreamer) with additional features for RK3588-based HDMI capture devices, specifically for the [StreamSentry](https://github.com/garagehq/StreamSentry) project.
+This is a fork of [PiKVM's ustreamer](https://github.com/pikvm/ustreamer) with additional features for RK3588-based HDMI capture devices, specifically for the [Minus](https://github.com/garagehq/Minus) project.
 
 ## Key Additions
 
@@ -93,9 +93,9 @@ sudo cp ustreamer /usr/local/bin/ustreamer-patched
 
 The build system auto-detects `librockchip-mpp-dev` and enables MPP hardware encoding if available. You'll see "MPP hardware encoder support enabled" during build.
 
-## Usage with StreamSentry
+## Usage with Minus
 
-StreamSentry automatically:
+Minus automatically:
 1. Probes the V4L2 device to detect format (NV12, BGR24, etc.)
 2. Starts ustreamer-patched with the correct format
 3. Uses `--encode-scale native` for automatic 4K→1080p downscaling
