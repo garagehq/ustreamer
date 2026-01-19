@@ -70,6 +70,7 @@
 #include "tools.h"
 #include "mime.h"
 #include "static.h"
+#include "../../libs/overlay.h"
 #ifdef WITH_SYSTEMD
 #	include "systemd/systemd.h"
 #endif
@@ -88,6 +89,10 @@ static void _http_callback_snapshot(struct evhttp_request *request, void *v_serv
 static void _http_callback_stream(struct evhttp_request *request, void *v_server);
 static void _http_callback_stream_write(struct bufferevent *buf_event, void *v_ctx);
 static void _http_callback_stream_error(struct bufferevent *buf_event, short what, void *v_ctx);
+
+// Overlay API callbacks
+static void _http_callback_overlay(struct evhttp_request *request, void *v_server);
+static void _http_callback_overlay_set(struct evhttp_request *request, void *v_server);
 
 static void _http_refresher(int fd, short event, void *v_server);
 static void _http_send_stream(us_server_s *server, bool stream_updated, bool frame_updated);
@@ -194,6 +199,9 @@ int us_server_listen(us_server_s *server) {
 		assert(!evhttp_set_cb(run->http, "/state", _http_callback_state, (void*)server));
 		assert(!evhttp_set_cb(run->http, "/snapshot", _http_callback_snapshot, (void*)server));
 		assert(!evhttp_set_cb(run->http, "/stream", _http_callback_stream, (void*)server));
+		// Overlay API endpoints
+		assert(!evhttp_set_cb(run->http, "/overlay", _http_callback_overlay, (void*)server));
+		assert(!evhttp_set_cb(run->http, "/overlay/set", _http_callback_overlay_set, (void*)server));
 	}
 
 	us_frame_copy(stream->run->blank->jpeg, ex->frame);
@@ -631,6 +639,136 @@ static void _http_callback_stream(struct evhttp_request *request, void *v_server
 	} else {
 		evhttp_request_free(request);
 	}
+}
+
+// ========== Overlay API ==========
+
+static void _http_callback_overlay(struct evhttp_request *request, void *v_server) {
+	us_server_s *const server = v_server;
+
+	PREPROCESS_REQUEST;
+
+	us_overlay_config_s config;
+	us_overlay_get_config(&config);
+
+	struct evbuffer *buf;
+	_A_EVBUFFER_NEW(buf);
+
+	// Return current overlay configuration as JSON
+	_A_EVBUFFER_ADD_PRINTF(buf,
+		"{\"ok\": true, \"result\": {"
+		" \"enabled\": %s,"
+		" \"text\": \"%s\","
+		" \"position\": %d,"
+		" \"x\": %d,"
+		" \"y\": %d,"
+		" \"scale\": %u,"
+		" \"color\": {\"y\": %u, \"u\": %u, \"v\": %u},"
+		" \"background\": {\"enabled\": %s, \"y\": %u, \"u\": %u, \"v\": %u, \"alpha\": %u},"
+		" \"padding\": %u"
+		"}}",
+		us_bool_to_string(config.enabled),
+		config.text,
+		config.position,
+		config.x,
+		config.y,
+		config.scale,
+		config.y_color, config.u_color, config.v_color,
+		us_bool_to_string(config.background),
+		config.bg_y, config.bg_u, config.bg_v, config.bg_alpha,
+		config.padding
+	);
+
+	_A_ADD_HEADER(request, "Content-Type", "application/json");
+	evhttp_send_reply(request, HTTP_OK, "OK", buf);
+	evbuffer_free(buf);
+}
+
+static void _http_callback_overlay_set(struct evhttp_request *request, void *v_server) {
+	us_server_s *const server = v_server;
+
+	PREPROCESS_REQUEST;
+
+	// Parse query parameters
+	struct evkeyvalq params;
+	evhttp_parse_query(evhttp_request_get_uri(request), &params);
+
+	const char *text = evhttp_find_header(&params, "text");
+	const char *enabled = evhttp_find_header(&params, "enabled");
+	const char *position = evhttp_find_header(&params, "position");
+	const char *x_str = evhttp_find_header(&params, "x");
+	const char *y_str = evhttp_find_header(&params, "y");
+	const char *scale = evhttp_find_header(&params, "scale");
+	const char *color_y = evhttp_find_header(&params, "color_y");
+	const char *color_u = evhttp_find_header(&params, "color_u");
+	const char *color_v = evhttp_find_header(&params, "color_v");
+	const char *bg_enabled = evhttp_find_header(&params, "bg_enabled");
+	const char *bg_y = evhttp_find_header(&params, "bg_y");
+	const char *bg_u = evhttp_find_header(&params, "bg_u");
+	const char *bg_v = evhttp_find_header(&params, "bg_v");
+	const char *bg_alpha = evhttp_find_header(&params, "bg_alpha");
+	const char *padding = evhttp_find_header(&params, "padding");
+	const char *clear = evhttp_find_header(&params, "clear");
+
+	// Apply settings
+	if (clear != NULL && (!strcmp(clear, "1") || !strcmp(clear, "true"))) {
+		us_overlay_clear();
+	}
+
+	if (text != NULL) {
+		us_overlay_set_text(text);
+	}
+
+	if (position != NULL) {
+		int pos = atoi(position);
+		int x = x_str ? atoi(x_str) : 0;
+		int y = y_str ? atoi(y_str) : 0;
+		us_overlay_set_position((us_overlay_pos_e)pos, x, y);
+	} else if (x_str != NULL || y_str != NULL) {
+		us_overlay_config_s config;
+		us_overlay_get_config(&config);
+		int x = x_str ? atoi(x_str) : config.x;
+		int y = y_str ? atoi(y_str) : config.y;
+		us_overlay_set_position(US_OVERLAY_POS_CUSTOM, x, y);
+	}
+
+	if (scale != NULL) {
+		us_overlay_set_scale((uint)atoi(scale));
+	}
+
+	if (color_y != NULL || color_u != NULL || color_v != NULL) {
+		us_overlay_config_s config;
+		us_overlay_get_config(&config);
+		u8 y = color_y ? (u8)atoi(color_y) : config.y_color;
+		u8 u = color_u ? (u8)atoi(color_u) : config.u_color;
+		u8 v = color_v ? (u8)atoi(color_v) : config.v_color;
+		us_overlay_set_color(y, u, v);
+	}
+
+	if (bg_enabled != NULL || bg_y != NULL || bg_u != NULL || bg_v != NULL || bg_alpha != NULL) {
+		us_overlay_config_s config;
+		us_overlay_get_config(&config);
+		bool bg_en = bg_enabled ? (!strcmp(bg_enabled, "1") || !strcmp(bg_enabled, "true")) : config.background;
+		u8 y = bg_y ? (u8)atoi(bg_y) : config.bg_y;
+		u8 u = bg_u ? (u8)atoi(bg_u) : config.bg_u;
+		u8 v = bg_v ? (u8)atoi(bg_v) : config.bg_v;
+		u8 alpha = bg_alpha ? (u8)atoi(bg_alpha) : config.bg_alpha;
+		us_overlay_set_background(bg_en, y, u, v, alpha);
+	}
+
+	if (padding != NULL) {
+		us_overlay_set_padding((uint)atoi(padding));
+	}
+
+	if (enabled != NULL) {
+		bool en = (!strcmp(enabled, "1") || !strcmp(enabled, "true"));
+		us_overlay_enable(en);
+	}
+
+	evhttp_clear_headers(&params);
+
+	// Return updated configuration
+	_http_callback_overlay(request, v_server);
 }
 
 #undef PREPROCESS_REQUEST

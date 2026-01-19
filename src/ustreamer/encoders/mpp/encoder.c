@@ -42,6 +42,7 @@
 #include "../../../libs/tools.h"
 #include "../../../libs/logging.h"
 #include "../../../libs/frame.h"
+#include "../../../libs/overlay.h"
 
 #include "../../encoder.h"  // For us_g_encode_scale
 
@@ -156,6 +157,17 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 			return -1;
 		}
 		memcpy(buf_ptr, src->data, copy_size);
+	}
+
+	// Apply text overlay if enabled (for NV12 format only)
+	if (src->format == V4L2_PIX_FMT_NV12 && us_g_overlay != NULL) {
+		u8 *y_plane = (u8*)buf_ptr;
+		u8 *uv_plane = y_plane + (enc->hor_stride * enc->ver_stride);
+		us_overlay_draw_nv12(
+			y_plane, uv_plane,
+			enc->width, enc->height,
+			enc->hor_stride, enc->hor_stride
+		);
 	}
 
 	// Sync buffer to device (flush CPU cache for DMA access)
