@@ -802,7 +802,8 @@ static void _http_callback_blocking(struct evhttp_request *request, void *v_serv
 		" \"bg_width\": %u,"
 		" \"bg_height\": %u,"
 		" \"preview\": {\"enabled\": %s, \"x\": %d, \"y\": %d, \"w\": %u, \"h\": %u},"
-		" \"text_scale\": %u,"
+		" \"text_vocab_scale\": %u,"
+		" \"text_stats_scale\": %u,"
 		" \"text_color\": {\"y\": %u, \"u\": %u, \"v\": %u},"
 		" \"box_color\": {\"y\": %u, \"u\": %u, \"v\": %u, \"alpha\": %u}"
 		"}}",
@@ -815,7 +816,8 @@ static void _http_callback_blocking(struct evhttp_request *request, void *v_serv
 		config.preview_y,
 		config.preview_w,
 		config.preview_h,
-		config.text_scale,
+		config.text_vocab_scale,
+		config.text_stats_scale,
 		config.text_y, config.text_u, config.text_v,
 		config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
 	);
@@ -838,7 +840,8 @@ static void _http_callback_blocking_set(struct evhttp_request *request, void *v_
 	const char *clear = evhttp_find_header(&params, "clear");
 	const char *text_vocab = evhttp_find_header(&params, "text_vocab");
 	const char *text_stats = evhttp_find_header(&params, "text_stats");
-	const char *text_scale = evhttp_find_header(&params, "text_scale");
+	const char *text_vocab_scale = evhttp_find_header(&params, "text_vocab_scale");
+	const char *text_stats_scale = evhttp_find_header(&params, "text_stats_scale");
 	const char *preview_x = evhttp_find_header(&params, "preview_x");
 	const char *preview_y = evhttp_find_header(&params, "preview_y");
 	const char *preview_w = evhttp_find_header(&params, "preview_w");
@@ -865,8 +868,12 @@ static void _http_callback_blocking_set(struct evhttp_request *request, void *v_
 		us_blocking_set_text_stats(text_stats);
 	}
 
-	if (text_scale != NULL) {
-		us_blocking_set_text_scale((uint)atoi(text_scale));
+	if (text_vocab_scale != NULL) {
+		us_blocking_set_text_vocab_scale((uint)atoi(text_vocab_scale));
+	}
+
+	if (text_stats_scale != NULL) {
+		us_blocking_set_text_stats_scale((uint)atoi(text_stats_scale));
 	}
 
 	if (preview_x != NULL || preview_y != NULL || preview_w != NULL || preview_h != NULL || preview_enabled != NULL) {

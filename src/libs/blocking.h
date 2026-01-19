@@ -56,7 +56,8 @@ typedef struct {
     // Text overlays
     char        text_vocab[US_BLOCKING_TEXT_VOCAB_SIZE];   // Spanish vocabulary
     char        text_stats[US_BLOCKING_TEXT_STATS_SIZE];   // Debug stats
-    uint        text_scale;         // Text scale factor (1-10)
+    uint        text_vocab_scale;   // Vocabulary text scale (1-15, default 6)
+    uint        text_stats_scale;   // Stats text scale (1-10, default 2)
 
     // Colors (YUV)
     u8          text_y, text_u, text_v;     // Text color
@@ -99,7 +100,8 @@ void us_blocking_set_preview(int x, int y, uint w, uint h, bool enabled);
 // Set text overlays
 void us_blocking_set_text_vocab(const char *text);
 void us_blocking_set_text_stats(const char *text);
-void us_blocking_set_text_scale(uint scale);
+void us_blocking_set_text_vocab_scale(uint scale);
+void us_blocking_set_text_stats_scale(uint scale);
 
 // Set colors
 void us_blocking_set_text_color(u8 y, u8 u, u8 v);

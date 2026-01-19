@@ -98,8 +98,9 @@ void us_blocking_init(void) {
     // Initialize atomic enabled flag
     atomic_store(&us_g_blocking->enabled_fast, false);
 
-    // Default text scale
-    us_g_blocking->config.text_scale = 3;
+    // Default text scales (vocab larger for readability, stats smaller)
+    us_g_blocking->config.text_vocab_scale = 10;  // Large for vocabulary (8x8 * 10 = 80px chars)
+    us_g_blocking->config.text_stats_scale = 4;   // Smaller for debug stats (8x8 * 4 = 32px chars)
 
     // Default colors: white text on semi-transparent black background
     us_g_blocking->config.text_y = 235;
@@ -317,13 +318,24 @@ void us_blocking_set_text_stats(const char *text) {
     US_MUTEX_UNLOCK(us_g_blocking->mutex);
 }
 
-void us_blocking_set_text_scale(uint scale) {
+void us_blocking_set_text_vocab_scale(uint scale) {
+    if (us_g_blocking == NULL) return;
+    if (scale < 1) scale = 1;
+    if (scale > 15) scale = 15;
+
+    US_MUTEX_LOCK(us_g_blocking->mutex);
+    us_g_blocking->config.text_vocab_scale = scale;
+    us_g_blocking->dirty = true;
+    US_MUTEX_UNLOCK(us_g_blocking->mutex);
+}
+
+void us_blocking_set_text_stats_scale(uint scale) {
     if (us_g_blocking == NULL) return;
     if (scale < 1) scale = 1;
     if (scale > 10) scale = 10;
 
     US_MUTEX_LOCK(us_g_blocking->mutex);
-    us_g_blocking->config.text_scale = scale;
+    us_g_blocking->config.text_stats_scale = scale;
     us_g_blocking->dirty = true;
     US_MUTEX_UNLOCK(us_g_blocking->mutex);
 }
@@ -385,7 +397,8 @@ void us_blocking_get_config(us_blocking_config_s *config) {
     config->preview_enabled = us_g_blocking->config.preview_enabled;
     memcpy(config->text_vocab, us_g_blocking->config.text_vocab, US_BLOCKING_TEXT_VOCAB_SIZE);
     memcpy(config->text_stats, us_g_blocking->config.text_stats, US_BLOCKING_TEXT_STATS_SIZE);
-    config->text_scale = us_g_blocking->config.text_scale;
+    config->text_vocab_scale = us_g_blocking->config.text_vocab_scale;
+    config->text_stats_scale = us_g_blocking->config.text_stats_scale;
     config->text_y = us_g_blocking->config.text_y;
     config->text_u = us_g_blocking->config.text_u;
     config->text_v = us_g_blocking->config.text_v;
@@ -676,7 +689,8 @@ void us_blocking_composite_nv12(
     config.preview_enabled = us_g_blocking->config.preview_enabled;
     memcpy(config.text_vocab, us_g_blocking->config.text_vocab, US_BLOCKING_TEXT_VOCAB_SIZE);
     memcpy(config.text_stats, us_g_blocking->config.text_stats, US_BLOCKING_TEXT_STATS_SIZE);
-    config.text_scale = us_g_blocking->config.text_scale;
+    config.text_vocab_scale = us_g_blocking->config.text_vocab_scale;
+    config.text_stats_scale = us_g_blocking->config.text_stats_scale;
     config.text_y = us_g_blocking->config.text_y;
     config.text_u = us_g_blocking->config.text_u;
     config.text_v = us_g_blocking->config.text_v;
@@ -773,13 +787,17 @@ void us_blocking_composite_nv12(
         }
     }
 
-    // Step 3: Draw vocabulary text (centered, top area)
+    // Step 3: Draw vocabulary text (centered both horizontally and vertically)
     if (config.text_vocab[0] != '\0') {
         uint text_w, text_h;
-        _calc_text_size(config.text_vocab, config.text_scale, &text_w, &text_h);
+        _calc_text_size(config.text_vocab, config.text_vocab_scale, &text_w, &text_h);
 
+        // Center horizontally
         int text_x = ((int)dst_width - (int)text_w) / 2;
-        int text_y = dst_height / 6;  // Upper third of screen
+
+        // Center vertically, but shift up a bit to leave room for preview in corner
+        // Use upper 60% of screen to avoid overlap with preview window
+        int text_y = ((int)dst_height * 6 / 10 - (int)text_h) / 2;
 
         if (text_x < 10) text_x = 10;
         if (text_y < 10) text_y = 10;
@@ -788,19 +806,19 @@ void us_blocking_composite_nv12(
             dst_y, dst_uv, dst_y_stride, dst_uv_stride,
             dst_width, dst_height,
             text_x, text_y,
-            config.text_vocab, config.text_scale,
+            config.text_vocab, config.text_vocab_scale,
             config.text_y, config.text_u, config.text_v,
             true, config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
         );
     }
 
-    // Step 4: Draw stats text (bottom-left)
+    // Step 4: Draw stats text (bottom-left, smaller font)
     if (config.text_stats[0] != '\0') {
         uint text_w, text_h;
-        _calc_text_size(config.text_stats, config.text_scale, &text_w, &text_h);
+        _calc_text_size(config.text_stats, config.text_stats_scale, &text_w, &text_h);
 
         int text_x = 20;
-        int text_y = (int)dst_height - (int)text_h - 40;
+        int text_y = (int)dst_height - (int)text_h - 30;
 
         if (text_y < 10) text_y = 10;
 
@@ -808,7 +826,7 @@ void us_blocking_composite_nv12(
             dst_y, dst_uv, dst_y_stride, dst_uv_stride,
             dst_width, dst_height,
             text_x, text_y,
-            config.text_stats, config.text_scale,
+            config.text_stats, config.text_stats_scale,
             config.text_y, config.text_u, config.text_v,
             true, config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
         );
