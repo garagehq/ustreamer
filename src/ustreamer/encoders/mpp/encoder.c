@@ -43,6 +43,7 @@
 #include "../../../libs/logging.h"
 #include "../../../libs/frame.h"
 #include "../../../libs/overlay.h"
+#include "../../../libs/blocking.h"
 
 #include "../../encoder.h"  // For us_g_encode_scale
 
@@ -159,8 +160,34 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 		memcpy(buf_ptr, src->data, copy_size);
 	}
 
-	// Apply text overlay if enabled (for NV12 format only)
-	if (src->format == V4L2_PIX_FMT_NV12 && us_g_overlay != NULL) {
+	// Check if blocking mode is enabled (atomic check - no mutex overhead)
+	bool blocking_enabled = us_blocking_is_enabled_fast();
+
+	if (blocking_enabled && src->format == V4L2_PIX_FMT_NV12) {
+		// Blocking mode: composite background + preview + text overlays
+		// Use pre-allocated buffer to avoid malloc/free per frame
+
+		// Copy source to blocking buffer first (composite overwrites destination)
+		memcpy(enc->blocking_buf, buf_ptr, enc->blocking_buf_size);
+
+		// Destination planes (MPP buffer - will be overwritten with composite)
+		u8 *dst_y = (u8*)buf_ptr;
+		u8 *dst_uv = dst_y + (enc->hor_stride * enc->ver_stride);
+
+		// Source planes from our copy (live video for preview window)
+		u8 *copy_y = enc->blocking_buf;
+		u8 *copy_uv = enc->blocking_buf + (enc->hor_stride * enc->ver_stride);
+
+		// Composite blocking overlay onto the frame
+		us_blocking_composite_nv12(
+			copy_y, copy_uv,                           // Source (live video for preview)
+			enc->width, enc->height,
+			enc->hor_stride, enc->hor_stride,
+			dst_y, dst_uv,                             // Destination (MPP buffer)
+			enc->width, enc->height,
+			enc->hor_stride, enc->hor_stride
+		);
+	} else if (src->format == V4L2_PIX_FMT_NV12 && us_g_overlay != NULL) {
 		// Normal mode: just apply text overlay if enabled
 		u8 *y_plane = (u8*)buf_ptr;
 		u8 *uv_plane = y_plane + (enc->hor_stride * enc->ver_stride);
@@ -360,6 +387,14 @@ static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, uint width, uint height, 
 		goto error;
 	}
 
+	// Pre-allocate blocking mode buffer (same size as frame buffer)
+	enc->blocking_buf_size = frame_size;
+	enc->blocking_buf = (u8*)malloc(enc->blocking_buf_size);
+	if (enc->blocking_buf == NULL) {
+		_LOG_ERROR("Failed to allocate blocking buffer");
+		goto error;
+	}
+
 	enc->ready = true;
 	_LOG_INFO("Encoder ready: %ux%u, stride=%ux%u, format=%d",
 		enc->width, enc->height, enc->hor_stride, enc->ver_stride, enc->mpp_format);
@@ -393,6 +428,13 @@ static void _mpp_encoder_cleanup(us_mpp_encoder_s *enc) {
 		mpp_destroy(enc->mpp_ctx);
 		enc->mpp_ctx = NULL;
 		enc->mpi = NULL;
+	}
+
+	// Free blocking mode buffer
+	if (enc->blocking_buf != NULL) {
+		free(enc->blocking_buf);
+		enc->blocking_buf = NULL;
+		enc->blocking_buf_size = 0;
 	}
 
 	enc->width = 0;
