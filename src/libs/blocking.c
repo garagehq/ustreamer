@@ -50,6 +50,17 @@ static FT_Face _ft_face_stats = NULL;   // Mono font for stats
 static bool _ft_initialized = false;
 static pthread_mutex_t _ft_mutex = PTHREAD_MUTEX_INITIALIZER;  // FreeType is NOT thread-safe
 
+// Raw frame storage for /snapshot/raw endpoint
+// Stores the unmodified source frame before blocking composite is applied
+static u8 *_raw_frame_buf = NULL;
+static uint _raw_frame_width = 0;
+static uint _raw_frame_height = 0;
+static uint _raw_frame_stride = 0;
+static size_t _raw_frame_size = 0;
+static pthread_mutex_t _raw_frame_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool _raw_frame_valid = false;
+static void _raw_frame_cleanup(void);  // Forward declaration
+
 // Font paths (DejaVu or FreeSans as fallback)
 #define FONT_PATH_VOCAB_PRIMARY   "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 #define FONT_PATH_VOCAB_FALLBACK  "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"
@@ -236,6 +247,9 @@ void us_blocking_destroy(void) {
 
     // Cleanup FreeType
     _ft_destroy();
+
+    // Cleanup raw frame buffer
+    _raw_frame_cleanup();
 
     _LOG_INFO("Blocking mode system destroyed");
 }
@@ -1144,4 +1158,87 @@ void us_blocking_composite_nv12(
     if (need_ft) {
         pthread_mutex_unlock(&_ft_mutex);
     }
+}
+
+// Store raw frame data for /snapshot/raw endpoint
+// Called from encoder BEFORE blocking composite is applied
+void us_blocking_store_raw_frame(const u8 *data, uint width, uint height, uint stride) {
+    if (data == NULL || width == 0 || height == 0) return;
+
+    // Calculate NV12 frame size
+    size_t y_size = stride * height;
+    size_t uv_size = stride * (height / 2);
+    size_t frame_size = y_size + uv_size;
+
+    pthread_mutex_lock(&_raw_frame_mutex);
+
+    // Reallocate if size changed
+    if (_raw_frame_buf == NULL || _raw_frame_size < frame_size) {
+        if (_raw_frame_buf != NULL) {
+            free(_raw_frame_buf);
+        }
+        _raw_frame_buf = (u8*)malloc(frame_size);
+        if (_raw_frame_buf == NULL) {
+            _raw_frame_size = 0;
+            _raw_frame_valid = false;
+            pthread_mutex_unlock(&_raw_frame_mutex);
+            return;
+        }
+        _raw_frame_size = frame_size;
+    }
+
+    // Copy raw frame data
+    memcpy(_raw_frame_buf, data, frame_size);
+    _raw_frame_width = width;
+    _raw_frame_height = height;
+    _raw_frame_stride = stride;
+    _raw_frame_valid = true;
+
+    pthread_mutex_unlock(&_raw_frame_mutex);
+}
+
+// Get raw frame data (thread-safe copy to caller's buffer)
+const u8 *us_blocking_get_raw_frame(uint *width, uint *height, uint *stride) {
+    pthread_mutex_lock(&_raw_frame_mutex);
+
+    if (!_raw_frame_valid || _raw_frame_buf == NULL) {
+        pthread_mutex_unlock(&_raw_frame_mutex);
+        return NULL;
+    }
+
+    if (width) *width = _raw_frame_width;
+    if (height) *height = _raw_frame_height;
+    if (stride) *stride = _raw_frame_stride;
+
+    // Note: Caller must hold mutex or copy data quickly
+    // For thread safety, we keep mutex locked - caller must call us_blocking_release_raw_frame()
+    return _raw_frame_buf;
+}
+
+// Release raw frame mutex (call after us_blocking_get_raw_frame)
+void us_blocking_release_raw_frame(void) {
+    pthread_mutex_unlock(&_raw_frame_mutex);
+}
+
+// Check if raw frame is available
+bool us_blocking_has_raw_frame(void) {
+    pthread_mutex_lock(&_raw_frame_mutex);
+    bool valid = _raw_frame_valid && _raw_frame_buf != NULL;
+    pthread_mutex_unlock(&_raw_frame_mutex);
+    return valid;
+}
+
+// Cleanup raw frame buffer (called from us_blocking_destroy)
+static void _raw_frame_cleanup(void) {
+    pthread_mutex_lock(&_raw_frame_mutex);
+    if (_raw_frame_buf != NULL) {
+        free(_raw_frame_buf);
+        _raw_frame_buf = NULL;
+    }
+    _raw_frame_size = 0;
+    _raw_frame_width = 0;
+    _raw_frame_height = 0;
+    _raw_frame_stride = 0;
+    _raw_frame_valid = false;
+    pthread_mutex_unlock(&_raw_frame_mutex);
 }

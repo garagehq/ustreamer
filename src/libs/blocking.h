@@ -125,3 +125,19 @@ void us_blocking_composite_nv12(
 
 // Get current config snapshot (thread-safe)
 void us_blocking_get_config(us_blocking_config_s *config);
+
+// Raw frame storage for /snapshot/raw
+// Stores the unmodified source frame before blocking composite
+void us_blocking_store_raw_frame(const u8 *data, uint width, uint height, uint stride);
+
+// Get raw frame data (returns pointer to internal buffer, caller must NOT free)
+// Returns NULL if no raw frame available
+// Sets width/height/stride if non-NULL
+// IMPORTANT: This keeps mutex locked! Caller MUST call us_blocking_release_raw_frame() after use
+const u8 *us_blocking_get_raw_frame(uint *width, uint *height, uint *stride);
+
+// Release raw frame mutex (MUST call after us_blocking_get_raw_frame)
+void us_blocking_release_raw_frame(void);
+
+// Check if raw frame is available
+bool us_blocking_has_raw_frame(void);

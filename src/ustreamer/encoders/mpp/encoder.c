@@ -167,6 +167,10 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 		// Blocking mode: composite background + preview + text overlays
 		// Use pre-allocated buffer to avoid malloc/free per frame
 
+		// Store raw frame BEFORE compositing for /snapshot/raw endpoint
+		// This allows OCR to read the actual video content during blocking
+		us_blocking_store_raw_frame((u8*)buf_ptr, enc->width, enc->height, enc->hor_stride);
+
 		// Copy source to blocking buffer first (composite overwrites destination)
 		memcpy(enc->blocking_buf, buf_ptr, enc->blocking_buf_size);
 

@@ -72,6 +72,7 @@
 #include "static.h"
 #include "../../libs/overlay.h"
 #include "../../libs/blocking.h"
+#include "../encoders/cpu/encoder.h"
 #ifdef WITH_SYSTEMD
 #	include "systemd/systemd.h"
 #endif
@@ -99,6 +100,7 @@ static void _http_callback_overlay_set(struct evhttp_request *request, void *v_s
 static void _http_callback_blocking(struct evhttp_request *request, void *v_server);
 static void _http_callback_blocking_set(struct evhttp_request *request, void *v_server);
 static void _http_callback_blocking_background(struct evhttp_request *request, void *v_server);
+static void _http_callback_snapshot_raw(struct evhttp_request *request, void *v_server);
 
 static void _http_refresher(int fd, short event, void *v_server);
 static void _http_send_stream(us_server_s *server, bool stream_updated, bool frame_updated);
@@ -212,6 +214,8 @@ int us_server_listen(us_server_s *server) {
 		assert(!evhttp_set_cb(run->http, "/blocking", _http_callback_blocking, (void*)server));
 		assert(!evhttp_set_cb(run->http, "/blocking/set", _http_callback_blocking_set, (void*)server));
 		assert(!evhttp_set_cb(run->http, "/blocking/background", _http_callback_blocking_background, (void*)server));
+		// Raw snapshot endpoint (bypasses blocking composite for OCR during ad blocking)
+		assert(!evhttp_set_cb(run->http, "/snapshot/raw", _http_callback_snapshot_raw, (void*)server));
 	}
 
 	us_frame_copy(stream->run->blank->jpeg, ex->frame);
@@ -982,6 +986,101 @@ static void _http_callback_blocking_background(struct evhttp_request *request, v
 	}
 
 	evbuffer_free(buf);
+}
+
+// Raw snapshot endpoint - returns unmodified video frame even when blocking is active
+// This is used by OCR to detect ad content during blocking mode
+static void _http_callback_snapshot_raw(struct evhttp_request *request, void *v_server) {
+	us_server_s *const server = v_server;
+
+	PREPROCESS_REQUEST;
+
+	// If not blocking or no raw frame available, redirect to regular snapshot
+	if (!us_blocking_is_enabled_fast() || !us_blocking_has_raw_frame()) {
+		// Just do a redirect to /snapshot
+		_A_ADD_HEADER(request, "Location", "/snapshot");
+		evhttp_send_reply(request, HTTP_MOVETEMP, "Temporary Redirect", NULL);
+		return;
+	}
+
+	// Get raw frame data (this locks the mutex)
+	uint width = 0, height = 0, stride = 0;
+	const u8 *raw_data = us_blocking_get_raw_frame(&width, &height, &stride);
+
+	if (raw_data == NULL || width == 0 || height == 0) {
+		us_blocking_release_raw_frame();
+		_A_ADD_HEADER(request, "Location", "/snapshot");
+		evhttp_send_reply(request, HTTP_MOVETEMP, "Temporary Redirect", NULL);
+		return;
+	}
+
+	// Create temporary frame structures for encoding
+	us_frame_s src_frame = {0};
+	us_frame_s dest_frame = {0};
+
+	// Calculate NV12 frame size
+	size_t y_size = stride * height;
+	size_t uv_size = stride * (height / 2);
+	size_t frame_size = y_size + uv_size;
+
+	// Set up source frame (NV12)
+	src_frame.data = (u8*)raw_data;  // Cast away const - we won't modify it
+	src_frame.used = frame_size;
+	src_frame.allocated = frame_size;
+	src_frame.width = width;
+	src_frame.height = height;
+	src_frame.format = V4L2_PIX_FMT_NV12;
+	src_frame.stride = stride;
+	src_frame.online = true;
+	src_frame.key = true;
+
+	// Allocate destination buffer for JPEG (estimate max size)
+	size_t max_jpeg_size = width * height * 3;  // Conservative estimate
+	dest_frame.data = (u8*)malloc(max_jpeg_size);
+	if (dest_frame.data == NULL) {
+		us_blocking_release_raw_frame();
+		struct evbuffer *buf;
+		_A_EVBUFFER_NEW(buf);
+		_A_EVBUFFER_ADD_PRINTF(buf, "Memory allocation failed");
+		evhttp_send_reply(request, HTTP_INTERNAL, "Internal Server Error", buf);
+		evbuffer_free(buf);
+		return;
+	}
+	dest_frame.allocated = max_jpeg_size;
+	dest_frame.used = 0;
+
+	// Encode to JPEG using CPU encoder (quality 80)
+	us_cpu_encoder_compress(&src_frame, &dest_frame, 80);
+
+	// Release the raw frame mutex now that we've copied the data
+	us_blocking_release_raw_frame();
+
+	// Check if encoding succeeded
+	if (dest_frame.used == 0) {
+		free(dest_frame.data);
+		struct evbuffer *buf;
+		_A_EVBUFFER_NEW(buf);
+		_A_EVBUFFER_ADD_PRINTF(buf, "JPEG encoding failed");
+		evhttp_send_reply(request, HTTP_INTERNAL, "Internal Server Error", buf);
+		evbuffer_free(buf);
+		return;
+	}
+
+	// Send JPEG response
+	struct evbuffer *buf;
+	_A_EVBUFFER_NEW(buf);
+	evbuffer_add(buf, dest_frame.data, dest_frame.used);
+
+	_A_ADD_HEADER(request, "Content-Type", "image/jpeg");
+	_A_ADD_HEADER(request, "Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, pre-check=0, post-check=0, max-age=0");
+	_A_ADD_HEADER(request, "Pragma", "no-cache");
+	_A_ADD_HEADER(request, "Expires", "Mon, 3 Jan 2000 12:34:56 GMT");
+	_A_ADD_HEADER(request, "X-Raw-Snapshot", "true");
+
+	evhttp_send_reply(request, HTTP_OK, "OK", buf);
+
+	evbuffer_free(buf);
+	free(dest_frame.data);
 }
 
 #undef PREPROCESS_REQUEST
