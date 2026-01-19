@@ -149,7 +149,7 @@ us_server_s *us_server_init(us_stream_s *stream) {
 	assert(!evthread_use_pthreads());
 	assert((run->base = event_base_new()) != NULL);
 	assert((run->http = evhttp_new(run->base)) != NULL);
-	evhttp_set_allowed_methods(run->http, EVHTTP_REQ_GET|EVHTTP_REQ_HEAD|EVHTTP_REQ_OPTIONS);
+	evhttp_set_allowed_methods(run->http, EVHTTP_REQ_GET|EVHTTP_REQ_HEAD|EVHTTP_REQ_OPTIONS|EVHTTP_REQ_POST);
 	return server;
 }
 

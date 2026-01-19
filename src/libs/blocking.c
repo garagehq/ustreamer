@@ -32,19 +32,38 @@
 #include <jpeglib.h>
 #include <setjmp.h>
 
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
 #include "tools.h"
 #include "threading.h"
 #include "logging.h"
-#include "frametext_font.h"
+#include "frametext_font.h"  // Fallback bitmap font
 
 // Global blocking instance
 us_blocking_s *us_g_blocking = NULL;
+
+// FreeType library and face handles
+static FT_Library _ft_library = NULL;
+static FT_Face _ft_face_vocab = NULL;   // Bold font for vocabulary
+static FT_Face _ft_face_stats = NULL;   // Mono font for stats
+static bool _ft_initialized = false;
+static pthread_mutex_t _ft_mutex = PTHREAD_MUTEX_INITIALIZER;  // FreeType is NOT thread-safe
+
+// Font paths (DejaVu or FreeSans as fallback)
+#define FONT_PATH_VOCAB_PRIMARY   "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+#define FONT_PATH_VOCAB_FALLBACK  "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"
+#define FONT_PATH_STATS_PRIMARY   "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+#define FONT_PATH_STATS_FALLBACK  "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf"
+
+// Base font size in pixels (will be scaled)
+#define FONT_BASE_SIZE  12
 
 #define _LOG_INFO(x_msg, ...)    US_LOG_INFO("BLOCKING: " x_msg, ##__VA_ARGS__)
 #define _LOG_DEBUG(x_msg, ...)   US_LOG_DEBUG("BLOCKING: " x_msg, ##__VA_ARGS__)
 #define _LOG_ERROR(x_msg, ...)   US_LOG_ERROR("BLOCKING: " x_msg, ##__VA_ARGS__)
 
-// Font dimensions
+// Bitmap font dimensions (fallback)
 #define FONT_CHAR_WIDTH     8
 #define FONT_CHAR_HEIGHT    8
 
@@ -78,6 +97,88 @@ static void _draw_scaled_nv12(
     uint frame_width, uint frame_height
 );
 
+// FreeType text rendering functions
+static void _ft_draw_text_nv12(
+    u8 *y_plane, u8 *uv_plane,
+    uint y_stride, uint uv_stride,
+    uint width, uint height,
+    int x, int y,
+    const char *text, FT_Face face, uint font_size,
+    u8 fg_y, u8 fg_u, u8 fg_v,
+    bool draw_bg, u8 bg_y, u8 bg_u, u8 bg_v, u8 bg_alpha
+);
+static void _ft_calc_text_size(const char *text, FT_Face face, uint font_size, uint *w, uint *h);
+
+// Initialize FreeType library and load fonts
+static void _ft_init(void) {
+    if (_ft_initialized) {
+        _LOG_INFO("FreeType already initialized");
+        return;
+    }
+
+    _LOG_INFO("Initializing FreeType...");
+
+    if (FT_Init_FreeType(&_ft_library)) {
+        _LOG_ERROR("Failed to initialize FreeType library");
+        return;
+    }
+    _LOG_INFO("FreeType library initialized");
+
+    // Load vocabulary font (bold)
+    _LOG_INFO("Loading vocab font from: %s", FONT_PATH_VOCAB_PRIMARY);
+    int err = FT_New_Face(_ft_library, FONT_PATH_VOCAB_PRIMARY, 0, &_ft_face_vocab);
+    if (err) {
+        _LOG_INFO("Primary vocab font failed (err=%d), trying fallback: %s", err, FONT_PATH_VOCAB_FALLBACK);
+        err = FT_New_Face(_ft_library, FONT_PATH_VOCAB_FALLBACK, 0, &_ft_face_vocab);
+        if (err) {
+            _LOG_ERROR("Failed to load vocab font (err=%d)", err);
+            _ft_face_vocab = NULL;
+        }
+    }
+
+    // Load stats font (monospace)
+    _LOG_INFO("Loading stats font from: %s", FONT_PATH_STATS_PRIMARY);
+    err = FT_New_Face(_ft_library, FONT_PATH_STATS_PRIMARY, 0, &_ft_face_stats);
+    if (err) {
+        _LOG_INFO("Primary stats font failed (err=%d), trying fallback: %s", err, FONT_PATH_STATS_FALLBACK);
+        err = FT_New_Face(_ft_library, FONT_PATH_STATS_FALLBACK, 0, &_ft_face_stats);
+        if (err) {
+            _LOG_ERROR("Failed to load stats font (err=%d)", err);
+            _ft_face_stats = NULL;
+        }
+    }
+
+    if (_ft_face_vocab) {
+        _LOG_INFO("Loaded vocab font: %s %s", _ft_face_vocab->family_name, _ft_face_vocab->style_name);
+    } else {
+        _LOG_ERROR("Vocab font is NULL!");
+    }
+    if (_ft_face_stats) {
+        _LOG_INFO("Loaded stats font: %s %s", _ft_face_stats->family_name, _ft_face_stats->style_name);
+    } else {
+        _LOG_ERROR("Stats font is NULL!");
+    }
+
+    _ft_initialized = true;
+    _LOG_INFO("FreeType initialization complete: vocab=%p, stats=%p", (void*)_ft_face_vocab, (void*)_ft_face_stats);
+}
+
+// Cleanup FreeType resources
+static void _ft_destroy(void) {
+    if (_ft_face_vocab) {
+        FT_Done_Face(_ft_face_vocab);
+        _ft_face_vocab = NULL;
+    }
+    if (_ft_face_stats) {
+        FT_Done_Face(_ft_face_stats);
+        _ft_face_stats = NULL;
+    }
+    if (_ft_library) {
+        FT_Done_FreeType(_ft_library);
+        _ft_library = NULL;
+    }
+    _ft_initialized = false;
+}
 
 void us_blocking_init(void) {
     if (us_g_blocking != NULL) {
@@ -113,6 +214,9 @@ void us_blocking_init(void) {
 
     us_g_blocking->dirty = false;
 
+    // Initialize FreeType fonts
+    _ft_init();
+
     _LOG_INFO("Blocking mode system initialized");
 }
 
@@ -129,6 +233,9 @@ void us_blocking_destroy(void) {
 
     free(us_g_blocking);
     us_g_blocking = NULL;
+
+    // Cleanup FreeType
+    _ft_destroy();
 
     _LOG_INFO("Blocking mode system destroyed");
 }
@@ -568,6 +675,127 @@ static void _draw_text_nv12(
     }
 }
 
+// FreeType: Calculate text dimensions
+static void _ft_calc_text_size(const char *text, FT_Face face, uint font_size, uint *w, uint *h) {
+    *w = 0;
+    *h = 0;
+
+    if (text == NULL || text[0] == '\0' || face == NULL) return;
+
+    FT_Set_Pixel_Sizes(face, 0, font_size);
+
+    uint max_width = 0;
+    uint current_width = 0;
+    uint num_lines = 1;
+    uint line_height = (face->size->metrics.height >> 6);
+
+    for (const char *p = text; *p; p++) {
+        if (*p == '\n') {
+            if (current_width > max_width) max_width = current_width;
+            current_width = 0;
+            num_lines++;
+        } else {
+            FT_UInt glyph_idx = FT_Get_Char_Index(face, (FT_ULong)*p);
+            if (FT_Load_Glyph(face, glyph_idx, FT_LOAD_DEFAULT) == 0) {
+                current_width += (face->glyph->advance.x >> 6);
+            }
+        }
+    }
+
+    if (current_width > max_width) max_width = current_width;
+
+    *w = max_width;
+    *h = num_lines * line_height;
+}
+
+// FreeType: Draw text with optional background
+static void _ft_draw_text_nv12(
+    u8 *y_plane, u8 *uv_plane,
+    uint y_stride, uint uv_stride,
+    uint width, uint height,
+    int x, int y,
+    const char *text, FT_Face face, uint font_size,
+    u8 fg_y, u8 fg_u, u8 fg_v,
+    bool draw_bg, u8 bg_y, u8 bg_u, u8 bg_v, u8 bg_alpha) {
+
+    if (text == NULL || text[0] == '\0' || face == NULL) return;
+
+    FT_Set_Pixel_Sizes(face, 0, font_size);
+
+    uint text_w, text_h;
+    _ft_calc_text_size(text, face, font_size, &text_w, &text_h);
+
+    uint padding = font_size / 2;
+    uint line_height = (face->size->metrics.height >> 6);
+
+    // Draw background if requested
+    if (draw_bg && text_w > 0 && text_h > 0) {
+        int bg_x = x > (int)padding ? x - (int)padding : 0;
+        int bg_y_pos = y > (int)padding ? y - (int)padding : 0;
+        uint bg_w = text_w + 2 * padding;
+        uint bg_h = text_h + 2 * padding;
+
+        _draw_rect_nv12(
+            y_plane, uv_plane, y_stride, uv_stride,
+            width, height,
+            bg_x, bg_y_pos, bg_w, bg_h,
+            bg_y, bg_u, bg_v, bg_alpha
+        );
+    }
+
+    // Render text
+    int pen_x = x;
+    int pen_y = y + (face->size->metrics.ascender >> 6);
+
+    for (const char *p = text; *p; p++) {
+        if (*p == '\n') {
+            pen_x = x;
+            pen_y += line_height;
+            continue;
+        }
+
+        FT_UInt glyph_idx = FT_Get_Char_Index(face, (FT_ULong)*p);
+        if (FT_Load_Glyph(face, glyph_idx, FT_LOAD_RENDER)) {
+            continue;
+        }
+
+        FT_GlyphSlot slot = face->glyph;
+        FT_Bitmap *bmp = &slot->bitmap;
+
+        int bmp_x = pen_x + slot->bitmap_left;
+        int bmp_y = pen_y - slot->bitmap_top;
+
+        // Draw glyph bitmap
+        for (uint row = 0; row < bmp->rows; row++) {
+            int py = bmp_y + row;
+            if (py < 0 || (uint)py >= height) continue;
+
+            for (uint col = 0; col < bmp->width; col++) {
+                int px = bmp_x + col;
+                if (px < 0 || (uint)px >= width) continue;
+
+                u8 alpha = bmp->buffer[row * bmp->pitch + col];
+                if (alpha == 0) continue;
+
+                // Alpha blend foreground color onto Y plane
+                u8 *y_ptr = &y_plane[py * y_stride + px];
+                *y_ptr = (u8)(((uint)alpha * fg_y + (255 - alpha) * (*y_ptr)) / 255);
+
+                // UV plane (2x2 subsampled)
+                if ((px % 2 == 0) && (py % 2 == 0)) {
+                    uint uv_x = px;
+                    uint uv_y = py / 2;
+                    u8 *uv_ptr = &uv_plane[uv_y * uv_stride + uv_x];
+                    uv_ptr[0] = (u8)(((uint)alpha * fg_u + (255 - alpha) * uv_ptr[0]) / 255);
+                    uv_ptr[1] = (u8)(((uint)alpha * fg_v + (255 - alpha) * uv_ptr[1]) / 255);
+                }
+            }
+        }
+
+        pen_x += (slot->advance.x >> 6);
+    }
+}
+
 // Scale and copy NV12 frame (for preview window)
 static void _draw_scaled_nv12(
     const u8 *src_y, const u8 *src_uv,
@@ -720,20 +948,56 @@ void us_blocking_composite_nv12(
 
     // Step 2: Draw preview window (scaled live video)
     if (config.preview_enabled && config.preview_w > 0 && config.preview_h > 0) {
+        // Scale preview dimensions proportionally if they exceed destination
+        // This handles resolution mismatches (e.g., API set for 4K but encoder outputs 1080p)
+        uint preview_w = config.preview_w;
+        uint preview_h = config.preview_h;
+
+        // If preview dimensions are larger than 50% of destination, scale them down proportionally
+        if (preview_w > dst_width || preview_h > dst_height) {
+            // Calculate scale factor to fit within destination
+            float scale_w = (float)dst_width / (float)preview_w;
+            float scale_h = (float)dst_height / (float)preview_h;
+            float scale = (scale_w < scale_h) ? scale_w : scale_h;
+
+            // Apply scale (aim for ~20% of screen for preview)
+            scale *= 0.2f;
+            preview_w = (uint)(preview_w * scale);
+            preview_h = (uint)(preview_h * scale);
+
+            // Ensure minimum size
+            if (preview_w < 160) preview_w = 160;
+            if (preview_h < 90) preview_h = 90;
+        }
+
+        // Ensure preview doesn't exceed destination
+        if (preview_w > dst_width) preview_w = dst_width;
+        if (preview_h > dst_height) preview_h = dst_height;
+
+        // Ensure even dimensions for NV12
+        preview_w &= ~1;
+        preview_h &= ~1;
+
         // Handle negative positions (from right/bottom edge)
         int preview_x = config.preview_x;
         int preview_y = config.preview_y;
 
         if (preview_x < 0) {
-            preview_x = (int)dst_width + preview_x - (int)config.preview_w;
+            preview_x = (int)dst_width + preview_x - (int)preview_w;
         }
         if (preview_y < 0) {
-            preview_y = (int)dst_height + preview_y - (int)config.preview_h;
+            preview_y = (int)dst_height + preview_y - (int)preview_h;
         }
 
         // Clamp to valid range
         if (preview_x < 0) preview_x = 0;
         if (preview_y < 0) preview_y = 0;
+        if (preview_x + (int)preview_w > (int)dst_width) {
+            preview_x = (int)dst_width - (int)preview_w;
+        }
+        if (preview_y + (int)preview_h > (int)dst_height) {
+            preview_y = (int)dst_height - (int)preview_h;
+        }
 
         // Ensure even coordinates for NV12
         preview_x &= ~1;
@@ -745,23 +1009,23 @@ void us_blocking_composite_nv12(
             src_y_stride, src_uv_stride,
             dst_y, dst_uv,
             preview_x, preview_y,
-            config.preview_w, config.preview_h,
+            preview_w, preview_h,
             dst_y_stride, dst_uv_stride,
             dst_width, dst_height
         );
 
         // Draw border around preview (white)
         // Top edge
-        for (uint x = preview_x; x < (uint)preview_x + config.preview_w && x < dst_width; x++) {
+        for (uint x = preview_x; x < (uint)preview_x + preview_w && x < dst_width; x++) {
             dst_y[preview_y * dst_y_stride + x] = 235;
             if (preview_y + 1 < (int)dst_height) {
                 dst_y[(preview_y + 1) * dst_y_stride + x] = 235;
             }
         }
         // Bottom edge
-        uint bottom_y = preview_y + config.preview_h - 1;
+        uint bottom_y = preview_y + preview_h - 1;
         if (bottom_y < dst_height) {
-            for (uint x = preview_x; x < (uint)preview_x + config.preview_w && x < dst_width; x++) {
+            for (uint x = preview_x; x < (uint)preview_x + preview_w && x < dst_width; x++) {
                 dst_y[bottom_y * dst_y_stride + x] = 235;
                 if (bottom_y > 0) {
                     dst_y[(bottom_y - 1) * dst_y_stride + x] = 235;
@@ -769,16 +1033,16 @@ void us_blocking_composite_nv12(
             }
         }
         // Left edge
-        for (uint y = preview_y; y < (uint)preview_y + config.preview_h && y < dst_height; y++) {
+        for (uint y = preview_y; y < (uint)preview_y + preview_h && y < dst_height; y++) {
             dst_y[y * dst_y_stride + preview_x] = 235;
             if (preview_x + 1 < (int)dst_width) {
                 dst_y[y * dst_y_stride + preview_x + 1] = 235;
             }
         }
         // Right edge
-        uint right_x = preview_x + config.preview_w - 1;
+        uint right_x = preview_x + preview_w - 1;
         if (right_x < dst_width) {
-            for (uint y = preview_y; y < (uint)preview_y + config.preview_h && y < dst_height; y++) {
+            for (uint y = preview_y; y < (uint)preview_y + preview_h && y < dst_height; y++) {
                 dst_y[y * dst_y_stride + right_x] = 235;
                 if (right_x > 0) {
                     dst_y[y * dst_y_stride + right_x - 1] = 235;
@@ -788,9 +1052,24 @@ void us_blocking_composite_nv12(
     }
 
     // Step 3: Draw vocabulary text (centered both horizontally and vertically)
+    // CRITICAL: FreeType is NOT thread-safe, must serialize access from multiple encoder workers
+    bool need_ft = _ft_initialized && ((_ft_face_vocab && config.text_vocab[0] != '\0') ||
+                                        (_ft_face_stats && config.text_stats[0] != '\0'));
+    if (need_ft) {
+        pthread_mutex_lock(&_ft_mutex);
+    }
+
     if (config.text_vocab[0] != '\0') {
+        // Use FreeType if available, otherwise fall back to bitmap font
+        uint font_size = config.text_vocab_scale * FONT_BASE_SIZE;  // Scale to pixel size
+        FT_Face face = _ft_face_vocab;
+
         uint text_w, text_h;
-        _calc_text_size(config.text_vocab, config.text_vocab_scale, &text_w, &text_h);
+        if (face && _ft_initialized) {
+            _ft_calc_text_size(config.text_vocab, face, font_size, &text_w, &text_h);
+        } else {
+            _calc_text_size(config.text_vocab, config.text_vocab_scale, &text_w, &text_h);
+        }
 
         // Center horizontally
         int text_x = ((int)dst_width - (int)text_w) / 2;
@@ -802,33 +1081,67 @@ void us_blocking_composite_nv12(
         if (text_x < 10) text_x = 10;
         if (text_y < 10) text_y = 10;
 
-        _draw_text_nv12(
-            dst_y, dst_uv, dst_y_stride, dst_uv_stride,
-            dst_width, dst_height,
-            text_x, text_y,
-            config.text_vocab, config.text_vocab_scale,
-            config.text_y, config.text_u, config.text_v,
-            true, config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
-        );
+        if (face && _ft_initialized) {
+            _ft_draw_text_nv12(
+                dst_y, dst_uv, dst_y_stride, dst_uv_stride,
+                dst_width, dst_height,
+                text_x, text_y,
+                config.text_vocab, face, font_size,
+                config.text_y, config.text_u, config.text_v,
+                true, config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
+            );
+        } else {
+            _draw_text_nv12(
+                dst_y, dst_uv, dst_y_stride, dst_uv_stride,
+                dst_width, dst_height,
+                text_x, text_y,
+                config.text_vocab, config.text_vocab_scale,
+                config.text_y, config.text_u, config.text_v,
+                true, config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
+            );
+        }
     }
 
     // Step 4: Draw stats text (bottom-left, smaller font)
     if (config.text_stats[0] != '\0') {
+        // Use FreeType if available, otherwise fall back to bitmap font
+        uint font_size = config.text_stats_scale * FONT_BASE_SIZE;  // Scale to pixel size
+        FT_Face face = _ft_face_stats;
+
         uint text_w, text_h;
-        _calc_text_size(config.text_stats, config.text_stats_scale, &text_w, &text_h);
+        if (face && _ft_initialized) {
+            _ft_calc_text_size(config.text_stats, face, font_size, &text_w, &text_h);
+        } else {
+            _calc_text_size(config.text_stats, config.text_stats_scale, &text_w, &text_h);
+        }
 
         int text_x = 20;
         int text_y = (int)dst_height - (int)text_h - 30;
 
         if (text_y < 10) text_y = 10;
 
-        _draw_text_nv12(
-            dst_y, dst_uv, dst_y_stride, dst_uv_stride,
-            dst_width, dst_height,
-            text_x, text_y,
-            config.text_stats, config.text_stats_scale,
-            config.text_y, config.text_u, config.text_v,
-            true, config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
-        );
+        if (face && _ft_initialized) {
+            _ft_draw_text_nv12(
+                dst_y, dst_uv, dst_y_stride, dst_uv_stride,
+                dst_width, dst_height,
+                text_x, text_y,
+                config.text_stats, face, font_size,
+                config.text_y, config.text_u, config.text_v,
+                true, config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
+            );
+        } else {
+            _draw_text_nv12(
+                dst_y, dst_uv, dst_y_stride, dst_uv_stride,
+                dst_width, dst_height,
+                text_x, text_y,
+                config.text_stats, config.text_stats_scale,
+                config.text_y, config.text_u, config.text_v,
+                true, config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
+            );
+        }
+    }
+
+    if (need_ft) {
+        pthread_mutex_unlock(&_ft_mutex);
     }
 }
