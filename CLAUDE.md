@@ -76,6 +76,94 @@ The bottleneck with CPU encoding is JPEG compression. The MPP hardware encoder b
 - `src/ustreamer/encoder.h` - Encode scale enum and extern declaration
 - `src/ustreamer/options.c` - `--encode-scale` CLI option with help text
 
+### Blocking Mode System (Ad Blocking Overlay)
+- `src/libs/blocking.c` - Core blocking overlay: FreeType text rendering, NV12 compositing, preview window
+- `src/libs/blocking.h` - Blocking API interface and config structures
+- `src/ustreamer/http/server.c` - HTTP API endpoints (`/blocking`, `/blocking/set`, `/blocking/background`)
+- `src/ustreamer/encoders/mpp/encoder.c` - Blocking composite integration in hot path
+
+### Text Overlay System
+- `src/libs/overlay.c` - Simple text overlay (non-blocking mode)
+- `src/libs/overlay.h` - Overlay API interface
+
+## Blocking Mode System
+
+The blocking mode system renders ad-blocking overlays directly in the MPP encoder pipeline at 60fps. This is used by [Minus](https://github.com/garagehq/Minus) for seamless ad blocking without GStreamer pipeline modifications.
+
+### Features
+- **FreeType TrueType Rendering**: Uses DejaVu Sans Bold (vocabulary) and DejaVu Sans Mono (stats)
+- **NV12 Direct Rendering**: Text rendered directly to NV12 planes for zero-copy compositing
+- **Resolution Flexible**: Automatically handles 1080p, 2K, and 4K output resolutions
+- **Preview Window**: Scaled live video thumbnail with border
+- **Pixelated Background**: Darkened, pixelated background from pre-ad content
+- **Thread-Safe**: Mutex-protected FreeType calls for multi-worker MPP encoding
+
+### API Endpoints
+
+**GET `/blocking`** - Get current blocking configuration
+```json
+{
+  "ok": true,
+  "result": {
+    "enabled": false,
+    "bg_valid": true,
+    "bg_width": 1920,
+    "bg_height": 1080,
+    "preview": {"enabled": true, "x": -40, "y": -40, "w": 384, "h": 216},
+    "text_vocab_scale": 10,
+    "text_stats_scale": 4,
+    "text_color": {"y": 235, "u": 128, "v": 128},
+    "box_color": {"y": 16, "u": 128, "v": 128, "alpha": 180}
+  }
+}
+```
+
+**GET `/blocking/set`** - Configure blocking mode
+| Parameter | Description |
+|-----------|-------------|
+| `enabled` | `true`/`1` to enable blocking overlay |
+| `text_vocab` | Vocabulary text (URL-encoded, supports `\n` for newlines) |
+| `text_stats` | Stats text (bottom-left corner) |
+| `text_vocab_scale` | Vocab font scale (e.g., 10 = 120px) |
+| `text_stats_scale` | Stats font scale (e.g., 4 = 48px) |
+| `preview_enabled` | Show live preview window |
+| `preview_x`, `preview_y` | Preview position (negative = from right/bottom edge) |
+| `preview_w`, `preview_h` | Preview dimensions (auto-scaled if exceeds frame) |
+| `text_y`, `text_u`, `text_v` | Text color in YUV |
+| `bg_box_y`, `bg_box_u`, `bg_box_v`, `bg_box_alpha` | Background box color |
+| `clear` | Clear all text/disable blocking |
+
+**POST `/blocking/background`** - Upload pixelated background (NV12 raw data)
+- Content-Type: application/octet-stream
+- Body: Raw NV12 data (width * height * 1.5 bytes)
+- Query params: `width`, `height`
+
+### Thread Safety
+
+FreeType is NOT thread-safe. With 4 parallel MPP encoder workers, a mutex (`_ft_mutex`) serializes all FreeType calls in the composite function to prevent crashes:
+
+```c
+static pthread_mutex_t _ft_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// In us_blocking_composite_nv12():
+if (need_ft) {
+    pthread_mutex_lock(&_ft_mutex);
+}
+// ... FreeType rendering ...
+if (need_ft) {
+    pthread_mutex_unlock(&_ft_mutex);
+}
+```
+
+### Resolution Handling
+
+The blocking system handles resolution mismatches between API calls (which may specify 4K dimensions) and actual encoder output (which may be 1080p due to `--encode-scale`):
+
+1. Preview dimensions are scaled proportionally if they exceed frame bounds
+2. Positions are clamped to valid ranges
+3. All coordinates are aligned to even values for NV12 compatibility
+4. Background is scaled to match output resolution
+
 ## Building
 
 ```bash

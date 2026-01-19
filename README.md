@@ -82,7 +82,17 @@ ustreamer --device=/dev/video0 --format=BGR24 --resolution=3840x2160 \
 | UYVY | `--format=UYVY` | Alternate YUV |
 | MJPEG | `--format=MJPEG` | Pre-compressed |
 
-See [CLAUDE.md](CLAUDE.md) for detailed development notes.
+### Blocking Mode (Ad Blocking Overlay)
+This fork includes a blocking mode system for rendering ad-blocking overlays directly in the MPP encoder pipeline:
+- **FreeType TrueType fonts** (DejaVu Sans Bold + Mono)
+- **60fps overlay rendering** with zero GStreamer overhead
+- **Live preview window** with scaled video thumbnail
+- **Pixelated background** support
+- **Resolution-flexible** (1080p, 2K, 4K)
+
+API endpoints: `/blocking`, `/blocking/set`, `/blocking/background`
+
+See [CLAUDE.md](CLAUDE.md) for detailed development notes and API documentation.
 
 -----
 
