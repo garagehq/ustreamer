@@ -71,6 +71,7 @@
 #include "mime.h"
 #include "static.h"
 #include "../../libs/overlay.h"
+#include "../../libs/blocking.h"
 #ifdef WITH_SYSTEMD
 #	include "systemd/systemd.h"
 #endif
@@ -93,6 +94,11 @@ static void _http_callback_stream_error(struct bufferevent *buf_event, short wha
 // Overlay API callbacks
 static void _http_callback_overlay(struct evhttp_request *request, void *v_server);
 static void _http_callback_overlay_set(struct evhttp_request *request, void *v_server);
+
+// Blocking API callbacks
+static void _http_callback_blocking(struct evhttp_request *request, void *v_server);
+static void _http_callback_blocking_set(struct evhttp_request *request, void *v_server);
+static void _http_callback_blocking_background(struct evhttp_request *request, void *v_server);
 
 static void _http_refresher(int fd, short event, void *v_server);
 static void _http_send_stream(us_server_s *server, bool stream_updated, bool frame_updated);
@@ -202,6 +208,10 @@ int us_server_listen(us_server_s *server) {
 		// Overlay API endpoints
 		assert(!evhttp_set_cb(run->http, "/overlay", _http_callback_overlay, (void*)server));
 		assert(!evhttp_set_cb(run->http, "/overlay/set", _http_callback_overlay_set, (void*)server));
+		// Blocking API endpoints
+		assert(!evhttp_set_cb(run->http, "/blocking", _http_callback_blocking, (void*)server));
+		assert(!evhttp_set_cb(run->http, "/blocking/set", _http_callback_blocking_set, (void*)server));
+		assert(!evhttp_set_cb(run->http, "/blocking/background", _http_callback_blocking_background, (void*)server));
 	}
 
 	us_frame_copy(stream->run->blank->jpeg, ex->frame);
@@ -769,6 +779,202 @@ static void _http_callback_overlay_set(struct evhttp_request *request, void *v_s
 
 	// Return updated configuration
 	_http_callback_overlay(request, v_server);
+}
+
+// ========== Blocking API ==========
+
+static void _http_callback_blocking(struct evhttp_request *request, void *v_server) {
+	us_server_s *const server = v_server;
+
+	PREPROCESS_REQUEST;
+
+	us_blocking_config_s config;
+	us_blocking_get_config(&config);
+
+	struct evbuffer *buf;
+	_A_EVBUFFER_NEW(buf);
+
+	// Return current blocking configuration as JSON
+	_A_EVBUFFER_ADD_PRINTF(buf,
+		"{\"ok\": true, \"result\": {"
+		" \"enabled\": %s,"
+		" \"bg_valid\": %s,"
+		" \"bg_width\": %u,"
+		" \"bg_height\": %u,"
+		" \"preview\": {\"enabled\": %s, \"x\": %d, \"y\": %d, \"w\": %u, \"h\": %u},"
+		" \"text_scale\": %u,"
+		" \"text_color\": {\"y\": %u, \"u\": %u, \"v\": %u},"
+		" \"box_color\": {\"y\": %u, \"u\": %u, \"v\": %u, \"alpha\": %u}"
+		"}}",
+		us_bool_to_string(config.enabled),
+		us_bool_to_string(config.bg_valid),
+		config.bg_width,
+		config.bg_height,
+		us_bool_to_string(config.preview_enabled),
+		config.preview_x,
+		config.preview_y,
+		config.preview_w,
+		config.preview_h,
+		config.text_scale,
+		config.text_y, config.text_u, config.text_v,
+		config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
+	);
+
+	_A_ADD_HEADER(request, "Content-Type", "application/json");
+	evhttp_send_reply(request, HTTP_OK, "OK", buf);
+	evbuffer_free(buf);
+}
+
+static void _http_callback_blocking_set(struct evhttp_request *request, void *v_server) {
+	us_server_s *const server = v_server;
+
+	PREPROCESS_REQUEST;
+
+	// Parse query parameters
+	struct evkeyvalq params;
+	evhttp_parse_query(evhttp_request_get_uri(request), &params);
+
+	const char *enabled = evhttp_find_header(&params, "enabled");
+	const char *clear = evhttp_find_header(&params, "clear");
+	const char *text_vocab = evhttp_find_header(&params, "text_vocab");
+	const char *text_stats = evhttp_find_header(&params, "text_stats");
+	const char *text_scale = evhttp_find_header(&params, "text_scale");
+	const char *preview_x = evhttp_find_header(&params, "preview_x");
+	const char *preview_y = evhttp_find_header(&params, "preview_y");
+	const char *preview_w = evhttp_find_header(&params, "preview_w");
+	const char *preview_h = evhttp_find_header(&params, "preview_h");
+	const char *preview_enabled = evhttp_find_header(&params, "preview_enabled");
+	const char *text_y = evhttp_find_header(&params, "text_y");
+	const char *text_u = evhttp_find_header(&params, "text_u");
+	const char *text_v = evhttp_find_header(&params, "text_v");
+	const char *box_y = evhttp_find_header(&params, "box_y");
+	const char *box_u = evhttp_find_header(&params, "box_u");
+	const char *box_v = evhttp_find_header(&params, "box_v");
+	const char *box_alpha = evhttp_find_header(&params, "box_alpha");
+
+	// Apply settings
+	if (clear != NULL && (!strcmp(clear, "1") || !strcmp(clear, "true"))) {
+		us_blocking_clear();
+	}
+
+	if (text_vocab != NULL) {
+		us_blocking_set_text_vocab(text_vocab);
+	}
+
+	if (text_stats != NULL) {
+		us_blocking_set_text_stats(text_stats);
+	}
+
+	if (text_scale != NULL) {
+		us_blocking_set_text_scale((uint)atoi(text_scale));
+	}
+
+	if (preview_x != NULL || preview_y != NULL || preview_w != NULL || preview_h != NULL || preview_enabled != NULL) {
+		us_blocking_config_s config;
+		us_blocking_get_config(&config);
+		int px = preview_x ? atoi(preview_x) : config.preview_x;
+		int py = preview_y ? atoi(preview_y) : config.preview_y;
+		uint pw = preview_w ? (uint)atoi(preview_w) : config.preview_w;
+		uint ph = preview_h ? (uint)atoi(preview_h) : config.preview_h;
+		bool pe = preview_enabled ? (!strcmp(preview_enabled, "1") || !strcmp(preview_enabled, "true")) : config.preview_enabled;
+		us_blocking_set_preview(px, py, pw, ph, pe);
+	}
+
+	if (text_y != NULL || text_u != NULL || text_v != NULL) {
+		us_blocking_config_s config;
+		us_blocking_get_config(&config);
+		u8 y = text_y ? (u8)atoi(text_y) : config.text_y;
+		u8 u = text_u ? (u8)atoi(text_u) : config.text_u;
+		u8 v = text_v ? (u8)atoi(text_v) : config.text_v;
+		us_blocking_set_text_color(y, u, v);
+	}
+
+	if (box_y != NULL || box_u != NULL || box_v != NULL || box_alpha != NULL) {
+		us_blocking_config_s config;
+		us_blocking_get_config(&config);
+		u8 y = box_y ? (u8)atoi(box_y) : config.bg_box_y;
+		u8 u = box_u ? (u8)atoi(box_u) : config.bg_box_u;
+		u8 v = box_v ? (u8)atoi(box_v) : config.bg_box_v;
+		u8 alpha = box_alpha ? (u8)atoi(box_alpha) : config.bg_box_alpha;
+		us_blocking_set_box_color(y, u, v, alpha);
+	}
+
+	if (enabled != NULL) {
+		bool en = (!strcmp(enabled, "1") || !strcmp(enabled, "true"));
+		us_blocking_enable(en);
+	}
+
+	evhttp_clear_headers(&params);
+
+	// Return updated configuration
+	_http_callback_blocking(request, v_server);
+}
+
+static void _http_callback_blocking_background(struct evhttp_request *request, void *v_server) {
+	us_server_s *const server = v_server;
+
+	PREPROCESS_REQUEST;
+
+	// This endpoint accepts POST with JPEG data
+	if (evhttp_request_get_command(request) != EVHTTP_REQ_POST) {
+		struct evbuffer *buf;
+		_A_EVBUFFER_NEW(buf);
+		_A_EVBUFFER_ADD_PRINTF(buf, "{\"ok\": false, \"error\": \"POST required\"}");
+		_A_ADD_HEADER(request, "Content-Type", "application/json");
+		evhttp_send_reply(request, HTTP_BADMETHOD, "Method Not Allowed", buf);
+		evbuffer_free(buf);
+		return;
+	}
+
+	struct evbuffer *input = evhttp_request_get_input_buffer(request);
+	size_t data_len = evbuffer_get_length(input);
+
+	if (data_len == 0) {
+		struct evbuffer *buf;
+		_A_EVBUFFER_NEW(buf);
+		_A_EVBUFFER_ADD_PRINTF(buf, "{\"ok\": false, \"error\": \"No data provided\"}");
+		_A_ADD_HEADER(request, "Content-Type", "application/json");
+		evhttp_send_reply(request, HTTP_BADREQUEST, "Bad Request", buf);
+		evbuffer_free(buf);
+		return;
+	}
+
+	// Copy data from evbuffer
+	u8 *jpeg_data = (u8*)malloc(data_len);
+	if (jpeg_data == NULL) {
+		struct evbuffer *buf;
+		_A_EVBUFFER_NEW(buf);
+		_A_EVBUFFER_ADD_PRINTF(buf, "{\"ok\": false, \"error\": \"Memory allocation failed\"}");
+		_A_ADD_HEADER(request, "Content-Type", "application/json");
+		evhttp_send_reply(request, HTTP_INTERNAL, "Internal Server Error", buf);
+		evbuffer_free(buf);
+		return;
+	}
+
+	evbuffer_copyout(input, jpeg_data, data_len);
+
+	// Set background
+	int result = us_blocking_set_background_jpeg(jpeg_data, data_len);
+	free(jpeg_data);
+
+	struct evbuffer *buf;
+	_A_EVBUFFER_NEW(buf);
+
+	if (result == 0) {
+		us_blocking_config_s config;
+		us_blocking_get_config(&config);
+		_A_EVBUFFER_ADD_PRINTF(buf,
+			"{\"ok\": true, \"result\": {\"bg_width\": %u, \"bg_height\": %u}}",
+			config.bg_width, config.bg_height);
+		_A_ADD_HEADER(request, "Content-Type", "application/json");
+		evhttp_send_reply(request, HTTP_OK, "OK", buf);
+	} else {
+		_A_EVBUFFER_ADD_PRINTF(buf, "{\"ok\": false, \"error\": \"Failed to decode JPEG\"}");
+		_A_ADD_HEADER(request, "Content-Type", "application/json");
+		evhttp_send_reply(request, HTTP_BADREQUEST, "Bad Request", buf);
+	}
+
+	evbuffer_free(buf);
 }
 
 #undef PREPROCESS_REQUEST
