@@ -45,8 +45,9 @@ us_blocking_s *us_g_blocking = NULL;
 
 // FreeType library and face handles
 static FT_Library _ft_library = NULL;
-static FT_Face _ft_face_vocab = NULL;   // Bold font for vocabulary
-static FT_Face _ft_face_stats = NULL;   // Mono font for stats
+static FT_Face _ft_face_vocab = NULL;   // DejaVu Sans Bold for vocabulary text
+static FT_Face _ft_face_word = NULL;    // IBM Plex Mono Bold for Spanish word
+static FT_Face _ft_face_stats = NULL;   // IBM Plex Mono Regular for stats
 static bool _ft_initialized = false;
 static pthread_mutex_t _ft_mutex = PTHREAD_MUTEX_INITIALIZER;  // FreeType is NOT thread-safe
 
@@ -61,11 +62,16 @@ static pthread_mutex_t _raw_frame_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool _raw_frame_valid = false;
 static void _raw_frame_cleanup(void);  // Forward declaration
 
-// Font paths (DejaVu or FreeSans as fallback)
+// Font paths
+// - Vocab text (header, translation, pronunciation, example): DejaVu Sans Bold - clean, readable
+// - Spanish word: IBM Plex Mono Bold - matches web UI aesthetic
+// - Stats: IBM Plex Mono Regular - monospace for alignment
 #define FONT_PATH_VOCAB_PRIMARY   "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 #define FONT_PATH_VOCAB_FALLBACK  "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"
-#define FONT_PATH_STATS_PRIMARY   "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
-#define FONT_PATH_STATS_FALLBACK  "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf"
+#define FONT_PATH_WORD_PRIMARY    "/usr/share/fonts/truetype/ibm-plex/IBMPlexMono-Bold.ttf"
+#define FONT_PATH_WORD_FALLBACK   "/usr/share/fonts/truetype/ibm-plex/IBMPlexMono-SemiBold.ttf"
+#define FONT_PATH_STATS_PRIMARY   "/usr/share/fonts/truetype/ibm-plex/IBMPlexMono-Regular.ttf"
+#define FONT_PATH_STATS_FALLBACK  "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 
 // Base font size in pixels (will be scaled)
 #define FONT_BASE_SIZE  12
@@ -147,6 +153,18 @@ static void _ft_init(void) {
         }
     }
 
+    // Load Spanish word font (IBM Plex Mono Bold)
+    _LOG_INFO("Loading word font from: %s", FONT_PATH_WORD_PRIMARY);
+    err = FT_New_Face(_ft_library, FONT_PATH_WORD_PRIMARY, 0, &_ft_face_word);
+    if (err) {
+        _LOG_INFO("Primary word font failed (err=%d), trying fallback: %s", err, FONT_PATH_WORD_FALLBACK);
+        err = FT_New_Face(_ft_library, FONT_PATH_WORD_FALLBACK, 0, &_ft_face_word);
+        if (err) {
+            _LOG_ERROR("Failed to load word font (err=%d), using vocab font", err);
+            _ft_face_word = NULL;
+        }
+    }
+
     // Load stats font (monospace)
     _LOG_INFO("Loading stats font from: %s", FONT_PATH_STATS_PRIMARY);
     err = FT_New_Face(_ft_library, FONT_PATH_STATS_PRIMARY, 0, &_ft_face_stats);
@@ -164,6 +182,11 @@ static void _ft_init(void) {
     } else {
         _LOG_ERROR("Vocab font is NULL!");
     }
+    if (_ft_face_word) {
+        _LOG_INFO("Loaded word font: %s %s", _ft_face_word->family_name, _ft_face_word->style_name);
+    } else {
+        _LOG_INFO("Word font is NULL, will use vocab font");
+    }
     if (_ft_face_stats) {
         _LOG_INFO("Loaded stats font: %s %s", _ft_face_stats->family_name, _ft_face_stats->style_name);
     } else {
@@ -171,7 +194,8 @@ static void _ft_init(void) {
     }
 
     _ft_initialized = true;
-    _LOG_INFO("FreeType initialization complete: vocab=%p, stats=%p", (void*)_ft_face_vocab, (void*)_ft_face_stats);
+    _LOG_INFO("FreeType initialization complete: vocab=%p, word=%p, stats=%p",
+              (void*)_ft_face_vocab, (void*)_ft_face_word, (void*)_ft_face_stats);
 }
 
 // Cleanup FreeType resources
@@ -179,6 +203,10 @@ static void _ft_destroy(void) {
     if (_ft_face_vocab) {
         FT_Done_Face(_ft_face_vocab);
         _ft_face_vocab = NULL;
+    }
+    if (_ft_face_word) {
+        FT_Done_Face(_ft_face_word);
+        _ft_face_word = NULL;
     }
     if (_ft_face_stats) {
         FT_Done_Face(_ft_face_stats);
@@ -218,6 +246,17 @@ void us_blocking_init(void) {
     us_g_blocking->config.text_y = 235;
     us_g_blocking->config.text_u = 128;
     us_g_blocking->config.text_v = 128;
+
+    // Purple for Spanish word (#a855f7 -> Y≈128, U≈195, V≈156)
+    us_g_blocking->config.color_word_y = 128;
+    us_g_blocking->config.color_word_u = 195;
+    us_g_blocking->config.color_word_v = 156;
+
+    // White for secondary text (pronunciation/example) - cleaner look
+    us_g_blocking->config.color_secondary_y = 235;
+    us_g_blocking->config.color_secondary_u = 128;
+    us_g_blocking->config.color_secondary_v = 128;
+
     us_g_blocking->config.bg_box_y = 16;
     us_g_blocking->config.bg_box_u = 128;
     us_g_blocking->config.bg_box_v = 128;
@@ -472,6 +511,28 @@ void us_blocking_set_text_color(u8 y, u8 u, u8 v) {
     US_MUTEX_UNLOCK(us_g_blocking->mutex);
 }
 
+void us_blocking_set_word_color(u8 y, u8 u, u8 v) {
+    if (us_g_blocking == NULL) return;
+
+    US_MUTEX_LOCK(us_g_blocking->mutex);
+    us_g_blocking->config.color_word_y = y;
+    us_g_blocking->config.color_word_u = u;
+    us_g_blocking->config.color_word_v = v;
+    us_g_blocking->dirty = true;
+    US_MUTEX_UNLOCK(us_g_blocking->mutex);
+}
+
+void us_blocking_set_secondary_color(u8 y, u8 u, u8 v) {
+    if (us_g_blocking == NULL) return;
+
+    US_MUTEX_LOCK(us_g_blocking->mutex);
+    us_g_blocking->config.color_secondary_y = y;
+    us_g_blocking->config.color_secondary_u = u;
+    us_g_blocking->config.color_secondary_v = v;
+    us_g_blocking->dirty = true;
+    US_MUTEX_UNLOCK(us_g_blocking->mutex);
+}
+
 void us_blocking_set_box_color(u8 y, u8 u, u8 v, u8 alpha) {
     if (us_g_blocking == NULL) return;
 
@@ -523,6 +584,12 @@ void us_blocking_get_config(us_blocking_config_s *config) {
     config->text_y = us_g_blocking->config.text_y;
     config->text_u = us_g_blocking->config.text_u;
     config->text_v = us_g_blocking->config.text_v;
+    config->color_word_y = us_g_blocking->config.color_word_y;
+    config->color_word_u = us_g_blocking->config.color_word_u;
+    config->color_word_v = us_g_blocking->config.color_word_v;
+    config->color_secondary_y = us_g_blocking->config.color_secondary_y;
+    config->color_secondary_u = us_g_blocking->config.color_secondary_u;
+    config->color_secondary_v = us_g_blocking->config.color_secondary_v;
     config->bg_box_y = us_g_blocking->config.bg_box_y;
     config->bg_box_u = us_g_blocking->config.bg_box_u;
     config->bg_box_v = us_g_blocking->config.bg_box_v;
@@ -810,6 +877,216 @@ static void _ft_draw_text_nv12(
     }
 }
 
+// Draw a single line of text (helper for multicolor rendering)
+static void _ft_draw_line_nv12(
+    u8 *y_plane, u8 *uv_plane,
+    uint y_stride, uint uv_stride,
+    uint width, uint height,
+    int x, int y,
+    const char *line, uint line_len, FT_Face face, uint font_size,
+    u8 fg_y, u8 fg_u, u8 fg_v) {
+
+    if (line == NULL || line_len == 0 || face == NULL) return;
+
+    // Ensure font size is set for this face (important when using multiple fonts)
+    FT_Set_Pixel_Sizes(face, 0, font_size);
+
+    int pen_x = x;
+    int pen_y = y + (face->size->metrics.ascender >> 6);
+
+    for (uint i = 0; i < line_len; i++) {
+        char c = line[i];
+        if (c == '\n') break;
+
+        FT_UInt glyph_idx = FT_Get_Char_Index(face, (FT_ULong)c);
+        if (FT_Load_Glyph(face, glyph_idx, FT_LOAD_RENDER)) {
+            continue;
+        }
+
+        FT_GlyphSlot slot = face->glyph;
+        FT_Bitmap *bmp = &slot->bitmap;
+
+        int bmp_x = pen_x + slot->bitmap_left;
+        int bmp_y = pen_y - slot->bitmap_top;
+
+        // Draw glyph
+        for (uint row = 0; row < bmp->rows; row++) {
+            int py = bmp_y + row;
+            if (py < 0 || (uint)py >= height) continue;
+
+            for (uint col = 0; col < bmp->width; col++) {
+                int px = bmp_x + col;
+                if (px < 0 || (uint)px >= width) continue;
+
+                u8 alpha = bmp->buffer[row * bmp->pitch + col];
+                if (alpha == 0) continue;
+
+                u8 *y_ptr = &y_plane[py * y_stride + px];
+                *y_ptr = (u8)(((uint)alpha * fg_y + (255 - alpha) * (*y_ptr)) / 255);
+
+                if ((px % 2 == 0) && (py % 2 == 0)) {
+                    uint uv_x = px;
+                    uint uv_y = py / 2;
+                    u8 *uv_ptr = &uv_plane[uv_y * uv_stride + uv_x];
+                    uv_ptr[0] = (u8)(((uint)alpha * fg_u + (255 - alpha) * uv_ptr[0]) / 255);
+                    uv_ptr[1] = (u8)(((uint)alpha * fg_v + (255 - alpha) * uv_ptr[1]) / 255);
+                }
+            }
+        }
+
+        pen_x += (slot->advance.x >> 6);
+    }
+}
+
+// Calculate width of a single line
+static uint _ft_calc_line_width(const char *line, uint line_len, FT_Face face, uint font_size) {
+    if (line == NULL || line_len == 0 || face == NULL) return 0;
+
+    // Ensure font size is set for this face
+    FT_Set_Pixel_Sizes(face, 0, font_size);
+
+    uint width = 0;
+    for (uint i = 0; i < line_len; i++) {
+        char c = line[i];
+        if (c == '\n') break;
+
+        FT_UInt glyph_idx = FT_Get_Char_Index(face, (FT_ULong)c);
+        if (FT_Load_Glyph(face, glyph_idx, FT_LOAD_DEFAULT) == 0) {
+            width += (face->glyph->advance.x >> 6);
+        }
+    }
+    return width;
+}
+
+// Draw vocabulary text with per-line colors matching web UI aesthetic
+// Line colors based on content:
+//   - Lines starting with '[' = header (white)
+//   - Lines starting with '(' = pronunciation (gray/secondary)
+//   - Lines starting with '=' = translation (white)
+//   - Lines starting with '"' = example (gray/secondary)
+//   - Other non-empty lines = Spanish word (purple/word color)
+static void _ft_draw_vocab_multicolor(
+    u8 *y_plane, u8 *uv_plane,
+    uint y_stride, uint uv_stride,
+    uint frame_width, uint frame_height,
+    int start_x, int start_y,
+    const char *text, FT_Face face, uint font_size,
+    u8 default_y, u8 default_u, u8 default_v,
+    u8 word_y, u8 word_u, u8 word_v,
+    u8 secondary_y, u8 secondary_u, u8 secondary_v,
+    bool draw_bg, u8 bg_y, u8 bg_u, u8 bg_v, u8 bg_alpha) {
+
+    if (text == NULL || text[0] == '\0' || face == NULL) return;
+
+    FT_Set_Pixel_Sizes(face, 0, font_size);
+
+    uint line_height = (face->size->metrics.height >> 6);
+    uint padding = font_size / 2;
+
+    // First pass: calculate total text dimensions for background box
+    uint text_w, text_h;
+    _ft_calc_text_size(text, face, font_size, &text_w, &text_h);
+
+    // Draw background box if requested
+    if (draw_bg && text_w > 0 && text_h > 0) {
+        int box_x = start_x - padding;
+        int box_y = start_y - padding;
+        uint box_w = text_w + padding * 2;
+        uint box_h = text_h + padding * 2;
+
+        if (box_x < 0) box_x = 0;
+        if (box_y < 0) box_y = 0;
+        if (box_x + box_w > frame_width) box_w = frame_width - box_x;
+        if (box_y + box_h > frame_height) box_h = frame_height - box_y;
+
+        for (uint dy = 0; dy < box_h; dy++) {
+            uint py = box_y + dy;
+            if (py >= frame_height) break;
+
+            for (uint dx = 0; dx < box_w; dx++) {
+                uint px = box_x + dx;
+                if (px >= frame_width) break;
+
+                u8 *y_ptr = &y_plane[py * y_stride + px];
+                *y_ptr = (u8)(((uint)bg_alpha * bg_y + (255 - bg_alpha) * (*y_ptr)) / 255);
+
+                if ((px % 2 == 0) && (py % 2 == 0)) {
+                    uint uv_x = px;
+                    uint uv_y = py / 2;
+                    u8 *uv_ptr = &uv_plane[uv_y * uv_stride + uv_x];
+                    uv_ptr[0] = (u8)(((uint)bg_alpha * bg_u + (255 - bg_alpha) * uv_ptr[0]) / 255);
+                    uv_ptr[1] = (u8)(((uint)bg_alpha * bg_v + (255 - bg_alpha) * uv_ptr[1]) / 255);
+                }
+            }
+        }
+    }
+
+    // Second pass: draw each line with appropriate color and font
+    const char *line_start = text;
+    int cur_y = start_y;
+
+    // Use word font for Spanish word if available, otherwise fall back to vocab font
+    FT_Face word_face = _ft_face_word ? _ft_face_word : face;
+
+    while (*line_start) {
+        // Find end of line
+        const char *line_end = line_start;
+        while (*line_end && *line_end != '\n') line_end++;
+        uint line_len = line_end - line_start;
+
+        if (line_len > 0) {
+            // Determine color and font based on first character
+            u8 fg_y, fg_u, fg_v;
+            FT_Face line_face;
+            char first_char = line_start[0];
+
+            if (first_char == '[') {
+                // Header - white, vocab font
+                fg_y = default_y; fg_u = default_u; fg_v = default_v;
+                line_face = face;
+            } else if (first_char == '(') {
+                // Pronunciation - secondary color, vocab font
+                fg_y = secondary_y; fg_u = secondary_u; fg_v = secondary_v;
+                line_face = face;
+            } else if (first_char == '=') {
+                // Translation - white, vocab font
+                fg_y = default_y; fg_u = default_u; fg_v = default_v;
+                line_face = face;
+            } else if (first_char == '"') {
+                // Example - secondary color, vocab font
+                fg_y = secondary_y; fg_u = secondary_u; fg_v = secondary_v;
+                line_face = face;
+            } else {
+                // Spanish word - purple, IBM Plex Mono font
+                fg_y = word_y; fg_u = word_u; fg_v = word_v;
+                line_face = word_face;
+            }
+
+            // Calculate line width for centering (using the correct font for this line)
+            uint line_w = _ft_calc_line_width(line_start, line_len, line_face, font_size);
+            int line_x = start_x + ((int)text_w - (int)line_w) / 2;
+
+            // Draw the line with the appropriate font
+            _ft_draw_line_nv12(
+                y_plane, uv_plane, y_stride, uv_stride,
+                frame_width, frame_height,
+                line_x, cur_y,
+                line_start, line_len, line_face, font_size,
+                fg_y, fg_u, fg_v
+            );
+        }
+
+        cur_y += line_height;
+
+        // Move to next line
+        if (*line_end == '\n') {
+            line_start = line_end + 1;
+        } else {
+            break;
+        }
+    }
+}
+
 // Scale and copy NV12 frame (for preview window)
 static void _draw_scaled_nv12(
     const u8 *src_y, const u8 *src_uv,
@@ -936,6 +1213,12 @@ void us_blocking_composite_nv12(
     config.text_y = us_g_blocking->config.text_y;
     config.text_u = us_g_blocking->config.text_u;
     config.text_v = us_g_blocking->config.text_v;
+    config.color_word_y = us_g_blocking->config.color_word_y;
+    config.color_word_u = us_g_blocking->config.color_word_u;
+    config.color_word_v = us_g_blocking->config.color_word_v;
+    config.color_secondary_y = us_g_blocking->config.color_secondary_y;
+    config.color_secondary_u = us_g_blocking->config.color_secondary_u;
+    config.color_secondary_v = us_g_blocking->config.color_secondary_v;
     config.bg_box_y = us_g_blocking->config.bg_box_y;
     config.bg_box_u = us_g_blocking->config.bg_box_u;
     config.bg_box_v = us_g_blocking->config.bg_box_v;
@@ -1096,12 +1379,15 @@ void us_blocking_composite_nv12(
         if (text_y < 10) text_y = 10;
 
         if (face && _ft_initialized) {
-            _ft_draw_text_nv12(
+            // Use multicolor rendering for vocabulary to match web UI aesthetic
+            _ft_draw_vocab_multicolor(
                 dst_y, dst_uv, dst_y_stride, dst_uv_stride,
                 dst_width, dst_height,
                 text_x, text_y,
                 config.text_vocab, face, font_size,
-                config.text_y, config.text_u, config.text_v,
+                config.text_y, config.text_u, config.text_v,           // Default (white)
+                config.color_word_y, config.color_word_u, config.color_word_v,  // Word (purple)
+                config.color_secondary_y, config.color_secondary_u, config.color_secondary_v,  // Secondary (gray)
                 true, config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
             );
         } else {

@@ -60,7 +60,9 @@ typedef struct {
     uint        text_stats_scale;   // Stats text scale (1-10, default 2)
 
     // Colors (YUV)
-    u8          text_y, text_u, text_v;     // Text color
+    u8          text_y, text_u, text_v;     // Default text color (white - for header/translation)
+    u8          color_word_y, color_word_u, color_word_v;       // Spanish word color (purple)
+    u8          color_secondary_y, color_secondary_u, color_secondary_v;  // Secondary text (gray - pronunciation/example)
     u8          bg_box_y, bg_box_u, bg_box_v, bg_box_alpha;  // Text background box
 } us_blocking_config_s;
 
@@ -105,6 +107,8 @@ void us_blocking_set_text_stats_scale(uint scale);
 
 // Set colors
 void us_blocking_set_text_color(u8 y, u8 u, u8 v);
+void us_blocking_set_word_color(u8 y, u8 u, u8 v);        // Spanish word (purple)
+void us_blocking_set_secondary_color(u8 y, u8 u, u8 v);  // Pronunciation/example (gray)
 void us_blocking_set_box_color(u8 y, u8 u, u8 v, u8 alpha);
 
 // Clear all blocking state

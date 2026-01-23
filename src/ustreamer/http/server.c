@@ -809,6 +809,8 @@ static void _http_callback_blocking(struct evhttp_request *request, void *v_serv
 		" \"text_vocab_scale\": %u,"
 		" \"text_stats_scale\": %u,"
 		" \"text_color\": {\"y\": %u, \"u\": %u, \"v\": %u},"
+		" \"word_color\": {\"y\": %u, \"u\": %u, \"v\": %u},"
+		" \"secondary_color\": {\"y\": %u, \"u\": %u, \"v\": %u},"
 		" \"box_color\": {\"y\": %u, \"u\": %u, \"v\": %u, \"alpha\": %u}"
 		"}}",
 		us_bool_to_string(config.enabled),
@@ -823,6 +825,8 @@ static void _http_callback_blocking(struct evhttp_request *request, void *v_serv
 		config.text_vocab_scale,
 		config.text_stats_scale,
 		config.text_y, config.text_u, config.text_v,
+		config.color_word_y, config.color_word_u, config.color_word_v,
+		config.color_secondary_y, config.color_secondary_u, config.color_secondary_v,
 		config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
 	);
 
@@ -858,6 +862,12 @@ static void _http_callback_blocking_set(struct evhttp_request *request, void *v_
 	const char *box_u = evhttp_find_header(&params, "box_u");
 	const char *box_v = evhttp_find_header(&params, "box_v");
 	const char *box_alpha = evhttp_find_header(&params, "box_alpha");
+	const char *word_y = evhttp_find_header(&params, "word_y");
+	const char *word_u = evhttp_find_header(&params, "word_u");
+	const char *word_v = evhttp_find_header(&params, "word_v");
+	const char *secondary_y = evhttp_find_header(&params, "secondary_y");
+	const char *secondary_u = evhttp_find_header(&params, "secondary_u");
+	const char *secondary_v = evhttp_find_header(&params, "secondary_v");
 
 	// Apply settings
 	if (clear != NULL && (!strcmp(clear, "1") || !strcmp(clear, "true"))) {
@@ -908,6 +918,24 @@ static void _http_callback_blocking_set(struct evhttp_request *request, void *v_
 		u8 v = box_v ? (u8)atoi(box_v) : config.bg_box_v;
 		u8 alpha = box_alpha ? (u8)atoi(box_alpha) : config.bg_box_alpha;
 		us_blocking_set_box_color(y, u, v, alpha);
+	}
+
+	if (word_y != NULL || word_u != NULL || word_v != NULL) {
+		us_blocking_config_s config;
+		us_blocking_get_config(&config);
+		u8 y = word_y ? (u8)atoi(word_y) : config.color_word_y;
+		u8 u = word_u ? (u8)atoi(word_u) : config.color_word_u;
+		u8 v = word_v ? (u8)atoi(word_v) : config.color_word_v;
+		us_blocking_set_word_color(y, u, v);
+	}
+
+	if (secondary_y != NULL || secondary_u != NULL || secondary_v != NULL) {
+		us_blocking_config_s config;
+		us_blocking_get_config(&config);
+		u8 y = secondary_y ? (u8)atoi(secondary_y) : config.color_secondary_y;
+		u8 u = secondary_u ? (u8)atoi(secondary_u) : config.color_secondary_u;
+		u8 v = secondary_v ? (u8)atoi(secondary_v) : config.color_secondary_v;
+		us_blocking_set_secondary_color(y, u, v);
 	}
 
 	if (enabled != NULL) {
