@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdatomic.h>
 
 #include <linux/videodev2.h>
 
@@ -57,6 +58,12 @@
 // Align macro for MPP buffer alignment
 #define MPP_ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
+// Raw frame storage rate limiting: only store every N frames to reduce memcpy overhead
+// OCR/VLM capture at 2s intervals during blocking (see capture.py _MIN_CAPTURE_INTERVAL_BLOCKING)
+// so we only need ~1fps updates - every 60 frames at 60fps is sufficient
+#define RAW_FRAME_UPDATE_INTERVAL 60
+static _Atomic uint _raw_frame_counter = 0;
+
 
 static void _mpp_encoder_cleanup(us_mpp_encoder_s *enc);
 static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, uint width, uint height, uint format);
@@ -66,6 +73,8 @@ static void _copy_nv12_aligned(const u8 *src_data, uint src_width, uint src_heig
                                u8 *dst_data, uint dst_hor_stride, uint dst_ver_stride);
 static void _downscale_nv12(const u8 *src_data, uint src_width, uint src_height,
                             u8 *dst_data, uint dst_width, uint dst_height);
+static void _convert_nv24_to_nv12(const u8 *src_data, uint width, uint height,
+                                   u8 *dst_data, uint dst_hor_stride, uint dst_ver_stride);
 
 
 us_mpp_encoder_s *us_mpp_jpeg_encoder_init(const char *name, uint quality) {
@@ -99,8 +108,15 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 	_get_target_resolution(src, &target_width, &target_height);
 	bool needs_downscale = (target_width != src->width || target_height != src->height);
 
+	// Check if we need NV24->NV12 conversion
+	// The MPP VEPU hardware encoder only reliably supports NV12 input.
+	// When sources output NV24 (e.g., Roku at 720p), we convert to NV12.
+	bool needs_nv24_conversion = (src->format == V4L2_PIX_FMT_NV24);
+	uint encoder_format = needs_nv24_conversion ? V4L2_PIX_FMT_NV12 : src->format;
+
 	// Ensure encoder is configured for target dimensions
-	if (_mpp_encoder_prepare(enc, target_width, target_height, src->format) < 0) {
+	// Always use NV12 format for MPP since that's what the hardware supports reliably
+	if (_mpp_encoder_prepare(enc, target_width, target_height, encoder_format) < 0) {
 		_LOG_ERROR("Failed to prepare encoder");
 		return -1;
 	}
@@ -140,7 +156,12 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 	size_t buf_size = mpp_buffer_get_size(enc->frame_buf);
 	memset(buf_ptr, 0, buf_size);
 
-	if (needs_downscale && src->format == V4L2_PIX_FMT_NV12) {
+	if (needs_nv24_conversion) {
+		// Convert NV24 to NV12 for MPP encoder
+		// This enables encoding from sources like Roku that output NV24
+		_convert_nv24_to_nv12(src->data, src->width, src->height,
+		                       buf_ptr, enc->hor_stride, enc->ver_stride);
+	} else if (needs_downscale && src->format == V4L2_PIX_FMT_NV12) {
 		// Downscale NV12 frame to target resolution
 		_downscale_nv12(src->data, src->width, src->height,
 		                buf_ptr, target_width, target_height);
@@ -163,13 +184,18 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 	// Check if blocking mode is enabled (atomic check - no mutex overhead)
 	bool blocking_enabled = us_blocking_is_enabled_fast();
 
-	if (blocking_enabled && src->format == V4L2_PIX_FMT_NV12) {
+	// Blocking mode works with NV12 data (after NV24 conversion if needed)
+	if (blocking_enabled && (src->format == V4L2_PIX_FMT_NV12 || needs_nv24_conversion)) {
 		// Blocking mode: composite background + preview + text overlays
 		// Use pre-allocated buffer to avoid malloc/free per frame
 
 		// Store raw frame BEFORE compositing for /snapshot/raw endpoint
-		// This allows OCR to read the actual video content during blocking
-		us_blocking_store_raw_frame((u8*)buf_ptr, enc->width, enc->height, enc->hor_stride);
+		// Only update every N frames to reduce ~12MB memcpy overhead
+		// OCR/VLM don't need 60fps - 2fps (every 30 frames) is plenty
+		uint frame_count = atomic_fetch_add(&_raw_frame_counter, 1);
+		if (frame_count % RAW_FRAME_UPDATE_INTERVAL == 0) {
+			us_blocking_store_raw_frame((u8*)buf_ptr, enc->width, enc->height, enc->hor_stride);
+		}
 
 		// Copy source to blocking buffer first (composite overwrites destination)
 		memcpy(enc->blocking_buf, buf_ptr, enc->blocking_buf_size);
@@ -191,7 +217,7 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 			enc->width, enc->height,
 			enc->hor_stride, enc->hor_stride
 		);
-	} else if (src->format == V4L2_PIX_FMT_NV12 && us_g_overlay != NULL) {
+	} else if ((src->format == V4L2_PIX_FMT_NV12 || needs_nv24_conversion) && us_g_overlay != NULL) {
 		// Normal mode: just apply text overlay if enabled
 		u8 *y_plane = (u8*)buf_ptr;
 		u8 *uv_plane = y_plane + (enc->hor_stride * enc->ver_stride);
@@ -586,6 +612,66 @@ static void _downscale_nv12(const u8 *src_data, uint src_width, uint src_height,
 			const uint sx = ((dx * scale_x_fp) >> 16) & ~1;  // Align to UV pair
 			dst_row[dx] = src_row[sx];
 			dst_row[dx + 1] = src_row[sx + 1];
+		}
+	}
+}
+
+static void _convert_nv24_to_nv12(const u8 *src_data, uint width, uint height,
+                                   u8 *dst_data, uint dst_hor_stride, uint dst_ver_stride) {
+	// Convert NV24 (YUV444SP) to NV12 (YUV420SP) for MPP encoder compatibility
+	// NV24: Y plane (full res) + UV plane (full res, interleaved)
+	// NV12: Y plane (full res) + UV plane (half res in both dimensions, interleaved)
+	//
+	// This allows HDMI sources that output NV24 (like Roku) to be encoded by MPP.
+
+	// Source planes
+	const u8 *src_y = src_data;
+	const u8 *src_uv = src_data + (width * height);  // Full resolution UV in NV24
+
+	// Destination planes (with stride alignment)
+	u8 *dst_y = dst_data;
+	u8 *dst_uv = dst_data + (dst_hor_stride * dst_ver_stride);
+
+	// Copy Y plane row by row (handles stride difference)
+	if (width == dst_hor_stride) {
+		// Fast path: strides match
+		memcpy(dst_y, src_y, width * height);
+	} else {
+		// Copy row by row with stride adjustment
+		for (uint y = 0; y < height; y++) {
+			memcpy(dst_y + y * dst_hor_stride, src_y + y * width, width);
+		}
+	}
+
+	// Subsample UV plane from 4:4:4 to 4:2:0
+	// For each 2x2 block of pixels, average the UV values
+	const uint dst_uv_height = height / 2;
+	const uint dst_uv_width = width;  // Width stays same (UV pairs)
+
+	for (uint dy = 0; dy < dst_uv_height; dy++) {
+		// Source UV rows (two rows that we'll average)
+		const u8 *src_uv_row0 = src_uv + (dy * 2) * (width * 2);      // Row y*2
+		const u8 *src_uv_row1 = src_uv + (dy * 2 + 1) * (width * 2);  // Row y*2+1
+
+		// Destination UV row
+		u8 *dst_uv_row = dst_uv + dy * dst_hor_stride;
+
+		// Process 2 pixels at a time (UV pair)
+		for (uint dx = 0; dx < dst_uv_width; dx += 2) {
+			// In NV24, UV is interleaved at full resolution: U0 V0 U1 V1 ...
+			// Average 2x2 block of UV values
+			uint u00 = src_uv_row0[dx * 2];       // U at (x, y*2)
+			uint v00 = src_uv_row0[dx * 2 + 1];   // V at (x, y*2)
+			uint u01 = src_uv_row0[dx * 2 + 2];   // U at (x+1, y*2)
+			uint v01 = src_uv_row0[dx * 2 + 3];   // V at (x+1, y*2)
+			uint u10 = src_uv_row1[dx * 2];       // U at (x, y*2+1)
+			uint v10 = src_uv_row1[dx * 2 + 1];   // V at (x, y*2+1)
+			uint u11 = src_uv_row1[dx * 2 + 2];   // U at (x+1, y*2+1)
+			uint v11 = src_uv_row1[dx * 2 + 3];   // V at (x+1, y*2+1)
+
+			// Average U and V for the 2x2 block
+			dst_uv_row[dx] = (u00 + u01 + u10 + u11 + 2) / 4;
+			dst_uv_row[dx + 1] = (v00 + v01 + v10 + v11 + 2) / 4;
 		}
 	}
 }

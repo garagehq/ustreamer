@@ -1042,31 +1042,52 @@ static void _http_callback_snapshot_raw(struct evhttp_request *request, void *v_
 		return;
 	}
 
-	// Create temporary frame structures for encoding
-	us_frame_s src_frame = {0};
-	us_frame_s dest_frame = {0};
-
 	// Calculate NV12 frame size
 	size_t y_size = stride * height;
 	size_t uv_size = stride * (height / 2);
 	size_t frame_size = y_size + uv_size;
 
-	// Set up source frame (NV12)
-	src_frame.data = (u8*)raw_data;  // Cast away const - we won't modify it
+	// CRITICAL: Copy frame data BEFORE releasing mutex to avoid holding it during encoding
+	// This prevents blocking MPP encoder workers from storing new raw frames
+	// Without this, CPU JPEG encoding (~50-100ms) blocks all 4 MPP workers
+	u8 *frame_copy = (u8*)malloc(frame_size);
+	if (frame_copy == NULL) {
+		us_blocking_release_raw_frame();
+		struct evbuffer *buf;
+		_A_EVBUFFER_NEW(buf);
+		_A_EVBUFFER_ADD_PRINTF(buf, "Memory allocation failed");
+		evhttp_send_reply(request, HTTP_INTERNAL, "Internal Server Error", buf);
+		evbuffer_free(buf);
+		return;
+	}
+	memcpy(frame_copy, raw_data, frame_size);
+	uint copy_width = width;
+	uint copy_height = height;
+	uint copy_stride = stride;
+
+	// Release mutex IMMEDIATELY after copying - don't hold during encoding
+	us_blocking_release_raw_frame();
+
+	// Create temporary frame structures for encoding
+	us_frame_s src_frame = {0};
+	us_frame_s dest_frame = {0};
+
+	// Set up source frame (NV12) - using our copied data
+	src_frame.data = frame_copy;
 	src_frame.used = frame_size;
 	src_frame.allocated = frame_size;
-	src_frame.width = width;
-	src_frame.height = height;
+	src_frame.width = copy_width;
+	src_frame.height = copy_height;
 	src_frame.format = V4L2_PIX_FMT_NV12;
-	src_frame.stride = stride;
+	src_frame.stride = copy_stride;
 	src_frame.online = true;
 	src_frame.key = true;
 
 	// Allocate destination buffer for JPEG (estimate max size)
-	size_t max_jpeg_size = width * height * 3;  // Conservative estimate
+	size_t max_jpeg_size = copy_width * copy_height * 3;  // Conservative estimate
 	dest_frame.data = (u8*)malloc(max_jpeg_size);
 	if (dest_frame.data == NULL) {
-		us_blocking_release_raw_frame();
+		free(frame_copy);
 		struct evbuffer *buf;
 		_A_EVBUFFER_NEW(buf);
 		_A_EVBUFFER_ADD_PRINTF(buf, "Memory allocation failed");
@@ -1077,11 +1098,11 @@ static void _http_callback_snapshot_raw(struct evhttp_request *request, void *v_
 	dest_frame.allocated = max_jpeg_size;
 	dest_frame.used = 0;
 
-	// Encode to JPEG using CPU encoder (quality 80)
+	// Encode to JPEG using CPU encoder (quality 80) - mutex no longer held!
 	us_cpu_encoder_compress(&src_frame, &dest_frame, 80);
 
-	// Release the raw frame mutex now that we've copied the data
-	us_blocking_release_raw_frame();
+	// Free the frame copy now that encoding is done
+	free(frame_copy);
 
 	// Check if encoding succeeded
 	if (dest_frame.used == 0) {
