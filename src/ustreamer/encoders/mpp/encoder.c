@@ -75,6 +75,8 @@ static void _downscale_nv12(const u8 *src_data, uint src_width, uint src_height,
                             u8 *dst_data, uint dst_width, uint dst_height);
 static void _convert_nv24_to_nv12(const u8 *src_data, uint width, uint height,
                                    u8 *dst_data, uint dst_hor_stride, uint dst_ver_stride);
+static void _convert_bgr24_to_nv12(const u8 *src_data, uint width, uint height,
+                                    u8 *dst_data, uint dst_hor_stride, uint dst_ver_stride);
 
 
 us_mpp_encoder_s *us_mpp_jpeg_encoder_init(const char *name, uint quality) {
@@ -108,11 +110,13 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 	_get_target_resolution(src, &target_width, &target_height);
 	bool needs_downscale = (target_width != src->width || target_height != src->height);
 
-	// Check if we need NV24->NV12 conversion
+	// Check if we need format conversion to NV12
 	// The MPP VEPU hardware encoder only reliably supports NV12 input.
-	// When sources output NV24 (e.g., Roku at 720p), we convert to NV12.
+	// When sources output NV24 (e.g., Roku at 720p) or BGR24 (e.g., Google TV),
+	// we convert to NV12 for encoding.
 	bool needs_nv24_conversion = (src->format == V4L2_PIX_FMT_NV24);
-	uint encoder_format = needs_nv24_conversion ? V4L2_PIX_FMT_NV12 : src->format;
+	bool needs_bgr24_conversion = (src->format == V4L2_PIX_FMT_BGR24);
+	uint encoder_format = (needs_nv24_conversion || needs_bgr24_conversion) ? V4L2_PIX_FMT_NV12 : src->format;
 
 	// Ensure encoder is configured for target dimensions
 	// Always use NV12 format for MPP since that's what the hardware supports reliably
@@ -161,6 +165,11 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 		// This enables encoding from sources like Roku that output NV24
 		_convert_nv24_to_nv12(src->data, src->width, src->height,
 		                       buf_ptr, enc->hor_stride, enc->ver_stride);
+	} else if (needs_bgr24_conversion) {
+		// Convert BGR24 to NV12 for MPP encoder
+		// This enables encoding from sources like Google TV that output BGR24
+		_convert_bgr24_to_nv12(src->data, src->width, src->height,
+		                        buf_ptr, enc->hor_stride, enc->ver_stride);
 	} else if (needs_downscale && src->format == V4L2_PIX_FMT_NV12) {
 		// Downscale NV12 frame to target resolution
 		_downscale_nv12(src->data, src->width, src->height,
@@ -184,8 +193,8 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 	// Check if blocking mode is enabled (atomic check - no mutex overhead)
 	bool blocking_enabled = us_blocking_is_enabled_fast();
 
-	// Blocking mode works with NV12 data (after NV24 conversion if needed)
-	if (blocking_enabled && (src->format == V4L2_PIX_FMT_NV12 || needs_nv24_conversion)) {
+	// Blocking mode works with NV12 data (after NV24/BGR24 conversion if needed)
+	if (blocking_enabled && (src->format == V4L2_PIX_FMT_NV12 || needs_nv24_conversion || needs_bgr24_conversion)) {
 		// Blocking mode: composite background + preview + text overlays
 		// Use pre-allocated buffer to avoid malloc/free per frame
 
@@ -217,7 +226,7 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 			enc->width, enc->height,
 			enc->hor_stride, enc->hor_stride
 		);
-	} else if ((src->format == V4L2_PIX_FMT_NV12 || needs_nv24_conversion) && us_g_overlay != NULL) {
+	} else if ((src->format == V4L2_PIX_FMT_NV12 || needs_nv24_conversion || needs_bgr24_conversion) && us_g_overlay != NULL) {
 		// Normal mode: just apply text overlay if enabled
 		u8 *y_plane = (u8*)buf_ptr;
 		u8 *uv_plane = y_plane + (enc->hor_stride * enc->ver_stride);
@@ -672,6 +681,92 @@ static void _convert_nv24_to_nv12(const u8 *src_data, uint width, uint height,
 			// Average U and V for the 2x2 block
 			dst_uv_row[dx] = (u00 + u01 + u10 + u11 + 2) / 4;
 			dst_uv_row[dx + 1] = (v00 + v01 + v10 + v11 + 2) / 4;
+		}
+	}
+}
+
+static void _convert_bgr24_to_nv12(const u8 *src_data, uint width, uint height,
+                                    u8 *dst_data, uint dst_hor_stride, uint dst_ver_stride) {
+	// Convert BGR24 to NV12 (YUV420SP) for MPP encoder compatibility
+	// BGR24: packed BGR bytes (B0 G0 R0 B1 G1 R1 ...)
+	// NV12: Y plane (full res) + UV plane (half res in both dimensions, interleaved)
+	//
+	// This allows HDMI sources that output BGR24 (like Google TV) to be encoded by MPP.
+	//
+	// Using BT.601 coefficients with fixed-point arithmetic:
+	// Y  = ( 66*R + 129*G +  25*B + 128) >> 8 + 16
+	// Cb = (-38*R -  74*G + 112*B + 128) >> 8 + 128
+	// Cr = (112*R -  94*G -  18*B + 128) >> 8 + 128
+
+	// Destination planes (with stride alignment)
+	u8 *dst_y = dst_data;
+	u8 *dst_uv = dst_data + (dst_hor_stride * dst_ver_stride);
+
+	// Convert Y plane - process every pixel
+	for (uint y = 0; y < height; y++) {
+		const u8 *src_row = src_data + y * width * 3;
+		u8 *dst_row = dst_y + y * dst_hor_stride;
+
+		for (uint x = 0; x < width; x++) {
+			uint b = src_row[x * 3];
+			uint g = src_row[x * 3 + 1];
+			uint r = src_row[x * 3 + 2];
+
+			// Y = (66*R + 129*G + 25*B + 128) >> 8 + 16
+			int y_val = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+			dst_row[x] = (u8)(y_val < 0 ? 0 : (y_val > 255 ? 255 : y_val));
+		}
+	}
+
+	// Convert UV plane - subsample 2x2 blocks
+	const uint dst_uv_height = height / 2;
+	const uint dst_uv_width = width / 2;
+
+	for (uint dy = 0; dy < dst_uv_height; dy++) {
+		// Source rows (two rows that we'll average)
+		const u8 *src_row0 = src_data + (dy * 2) * width * 3;
+		const u8 *src_row1 = src_data + (dy * 2 + 1) * width * 3;
+
+		// Destination UV row
+		u8 *dst_uv_row = dst_uv + dy * dst_hor_stride;
+
+		for (uint dx = 0; dx < dst_uv_width; dx++) {
+			// Get 2x2 block of BGR pixels
+			uint sx = dx * 2;
+
+			// Pixel (0,0)
+			uint b00 = src_row0[sx * 3];
+			uint g00 = src_row0[sx * 3 + 1];
+			uint r00 = src_row0[sx * 3 + 2];
+
+			// Pixel (1,0)
+			uint b01 = src_row0[(sx + 1) * 3];
+			uint g01 = src_row0[(sx + 1) * 3 + 1];
+			uint r01 = src_row0[(sx + 1) * 3 + 2];
+
+			// Pixel (0,1)
+			uint b10 = src_row1[sx * 3];
+			uint g10 = src_row1[sx * 3 + 1];
+			uint r10 = src_row1[sx * 3 + 2];
+
+			// Pixel (1,1)
+			uint b11 = src_row1[(sx + 1) * 3];
+			uint g11 = src_row1[(sx + 1) * 3 + 1];
+			uint r11 = src_row1[(sx + 1) * 3 + 2];
+
+			// Average the RGB values
+			uint r_avg = (r00 + r01 + r10 + r11 + 2) / 4;
+			uint g_avg = (g00 + g01 + g10 + g11 + 2) / 4;
+			uint b_avg = (b00 + b01 + b10 + b11 + 2) / 4;
+
+			// Cb = (-38*R - 74*G + 112*B + 128) >> 8 + 128
+			int cb = ((-38 * (int)r_avg - 74 * (int)g_avg + 112 * (int)b_avg + 128) >> 8) + 128;
+			// Cr = (112*R - 94*G - 18*B + 128) >> 8 + 128
+			int cr = ((112 * (int)r_avg - 94 * (int)g_avg - 18 * (int)b_avg + 128) >> 8) + 128;
+
+			// Clamp and store (NV12 is U then V interleaved)
+			dst_uv_row[dx * 2] = (u8)(cb < 0 ? 0 : (cb > 255 ? 255 : cb));
+			dst_uv_row[dx * 2 + 1] = (u8)(cr < 0 ? 0 : (cr > 255 ? 255 : cr));
 		}
 	}
 }
