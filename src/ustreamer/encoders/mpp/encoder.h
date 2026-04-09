@@ -47,6 +47,10 @@ typedef struct {
 	MppBuffer		frame_buf;
 	MppBuffer		pkt_buf;
 
+	// Blocking mode buffer (pre-allocated for zero per-frame allocations)
+	u8				*blocking_buf;
+	size_t			blocking_buf_size;
+
 	// Current configuration
 	uint			width;
 	uint			height;

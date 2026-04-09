@@ -71,6 +71,8 @@
 #include "mime.h"
 #include "static.h"
 #include "../../libs/overlay.h"
+#include "../../libs/blocking.h"
+#include "../encoders/cpu/encoder.h"
 #ifdef WITH_SYSTEMD
 #	include "systemd/systemd.h"
 #endif
@@ -93,6 +95,12 @@ static void _http_callback_stream_error(struct bufferevent *buf_event, short wha
 // Overlay API callbacks
 static void _http_callback_overlay(struct evhttp_request *request, void *v_server);
 static void _http_callback_overlay_set(struct evhttp_request *request, void *v_server);
+
+// Blocking API callbacks
+static void _http_callback_blocking(struct evhttp_request *request, void *v_server);
+static void _http_callback_blocking_set(struct evhttp_request *request, void *v_server);
+static void _http_callback_blocking_background(struct evhttp_request *request, void *v_server);
+static void _http_callback_snapshot_raw(struct evhttp_request *request, void *v_server);
 
 static void _http_refresher(int fd, short event, void *v_server);
 static void _http_send_stream(us_server_s *server, bool stream_updated, bool frame_updated);
@@ -143,7 +151,7 @@ us_server_s *us_server_init(us_stream_s *stream) {
 	assert(!evthread_use_pthreads());
 	assert((run->base = event_base_new()) != NULL);
 	assert((run->http = evhttp_new(run->base)) != NULL);
-	evhttp_set_allowed_methods(run->http, EVHTTP_REQ_GET|EVHTTP_REQ_HEAD|EVHTTP_REQ_OPTIONS);
+	evhttp_set_allowed_methods(run->http, EVHTTP_REQ_GET|EVHTTP_REQ_HEAD|EVHTTP_REQ_OPTIONS|EVHTTP_REQ_POST);
 	return server;
 }
 
@@ -202,6 +210,12 @@ int us_server_listen(us_server_s *server) {
 		// Overlay API endpoints
 		assert(!evhttp_set_cb(run->http, "/overlay", _http_callback_overlay, (void*)server));
 		assert(!evhttp_set_cb(run->http, "/overlay/set", _http_callback_overlay_set, (void*)server));
+		// Blocking API endpoints
+		assert(!evhttp_set_cb(run->http, "/blocking", _http_callback_blocking, (void*)server));
+		assert(!evhttp_set_cb(run->http, "/blocking/set", _http_callback_blocking_set, (void*)server));
+		assert(!evhttp_set_cb(run->http, "/blocking/background", _http_callback_blocking_background, (void*)server));
+		// Raw snapshot endpoint (bypasses blocking composite for OCR during ad blocking)
+		assert(!evhttp_set_cb(run->http, "/snapshot/raw", _http_callback_snapshot_raw, (void*)server));
 	}
 
 	us_frame_copy(stream->run->blank->jpeg, ex->frame);
@@ -769,6 +783,353 @@ static void _http_callback_overlay_set(struct evhttp_request *request, void *v_s
 
 	// Return updated configuration
 	_http_callback_overlay(request, v_server);
+}
+
+// ========== Blocking API ==========
+
+static void _http_callback_blocking(struct evhttp_request *request, void *v_server) {
+	us_server_s *const server = v_server;
+
+	PREPROCESS_REQUEST;
+
+	us_blocking_config_s config;
+	us_blocking_get_config(&config);
+
+	struct evbuffer *buf;
+	_A_EVBUFFER_NEW(buf);
+
+	// Return current blocking configuration as JSON
+	_A_EVBUFFER_ADD_PRINTF(buf,
+		"{\"ok\": true, \"result\": {"
+		" \"enabled\": %s,"
+		" \"bg_valid\": %s,"
+		" \"bg_width\": %u,"
+		" \"bg_height\": %u,"
+		" \"preview\": {\"enabled\": %s, \"x\": %d, \"y\": %d, \"w\": %u, \"h\": %u},"
+		" \"text_vocab_scale\": %u,"
+		" \"text_stats_scale\": %u,"
+		" \"text_color\": {\"y\": %u, \"u\": %u, \"v\": %u},"
+		" \"word_color\": {\"y\": %u, \"u\": %u, \"v\": %u},"
+		" \"secondary_color\": {\"y\": %u, \"u\": %u, \"v\": %u},"
+		" \"box_color\": {\"y\": %u, \"u\": %u, \"v\": %u, \"alpha\": %u}"
+		"}}",
+		us_bool_to_string(config.enabled),
+		us_bool_to_string(config.bg_valid),
+		config.bg_width,
+		config.bg_height,
+		us_bool_to_string(config.preview_enabled),
+		config.preview_x,
+		config.preview_y,
+		config.preview_w,
+		config.preview_h,
+		config.text_vocab_scale,
+		config.text_stats_scale,
+		config.text_y, config.text_u, config.text_v,
+		config.color_word_y, config.color_word_u, config.color_word_v,
+		config.color_secondary_y, config.color_secondary_u, config.color_secondary_v,
+		config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
+	);
+
+	_A_ADD_HEADER(request, "Content-Type", "application/json");
+	evhttp_send_reply(request, HTTP_OK, "OK", buf);
+	evbuffer_free(buf);
+}
+
+static void _http_callback_blocking_set(struct evhttp_request *request, void *v_server) {
+	us_server_s *const server = v_server;
+
+	PREPROCESS_REQUEST;
+
+	// Parse query parameters
+	struct evkeyvalq params;
+	evhttp_parse_query(evhttp_request_get_uri(request), &params);
+
+	const char *enabled = evhttp_find_header(&params, "enabled");
+	const char *clear = evhttp_find_header(&params, "clear");
+	const char *text_vocab = evhttp_find_header(&params, "text_vocab");
+	const char *text_stats = evhttp_find_header(&params, "text_stats");
+	const char *text_vocab_scale = evhttp_find_header(&params, "text_vocab_scale");
+	const char *text_stats_scale = evhttp_find_header(&params, "text_stats_scale");
+	const char *preview_x = evhttp_find_header(&params, "preview_x");
+	const char *preview_y = evhttp_find_header(&params, "preview_y");
+	const char *preview_w = evhttp_find_header(&params, "preview_w");
+	const char *preview_h = evhttp_find_header(&params, "preview_h");
+	const char *preview_enabled = evhttp_find_header(&params, "preview_enabled");
+	const char *text_y = evhttp_find_header(&params, "text_y");
+	const char *text_u = evhttp_find_header(&params, "text_u");
+	const char *text_v = evhttp_find_header(&params, "text_v");
+	const char *box_y = evhttp_find_header(&params, "box_y");
+	const char *box_u = evhttp_find_header(&params, "box_u");
+	const char *box_v = evhttp_find_header(&params, "box_v");
+	const char *box_alpha = evhttp_find_header(&params, "box_alpha");
+	const char *word_y = evhttp_find_header(&params, "word_y");
+	const char *word_u = evhttp_find_header(&params, "word_u");
+	const char *word_v = evhttp_find_header(&params, "word_v");
+	const char *secondary_y = evhttp_find_header(&params, "secondary_y");
+	const char *secondary_u = evhttp_find_header(&params, "secondary_u");
+	const char *secondary_v = evhttp_find_header(&params, "secondary_v");
+
+	// Apply settings
+	if (clear != NULL && (!strcmp(clear, "1") || !strcmp(clear, "true"))) {
+		us_blocking_clear();
+	}
+
+	if (text_vocab != NULL) {
+		us_blocking_set_text_vocab(text_vocab);
+	}
+
+	if (text_stats != NULL) {
+		us_blocking_set_text_stats(text_stats);
+	}
+
+	if (text_vocab_scale != NULL) {
+		us_blocking_set_text_vocab_scale((uint)atoi(text_vocab_scale));
+	}
+
+	if (text_stats_scale != NULL) {
+		us_blocking_set_text_stats_scale((uint)atoi(text_stats_scale));
+	}
+
+	if (preview_x != NULL || preview_y != NULL || preview_w != NULL || preview_h != NULL || preview_enabled != NULL) {
+		us_blocking_config_s config;
+		us_blocking_get_config(&config);
+		int px = preview_x ? atoi(preview_x) : config.preview_x;
+		int py = preview_y ? atoi(preview_y) : config.preview_y;
+		uint pw = preview_w ? (uint)atoi(preview_w) : config.preview_w;
+		uint ph = preview_h ? (uint)atoi(preview_h) : config.preview_h;
+		bool pe = preview_enabled ? (!strcmp(preview_enabled, "1") || !strcmp(preview_enabled, "true")) : config.preview_enabled;
+		us_blocking_set_preview(px, py, pw, ph, pe);
+	}
+
+	if (text_y != NULL || text_u != NULL || text_v != NULL) {
+		us_blocking_config_s config;
+		us_blocking_get_config(&config);
+		u8 y = text_y ? (u8)atoi(text_y) : config.text_y;
+		u8 u = text_u ? (u8)atoi(text_u) : config.text_u;
+		u8 v = text_v ? (u8)atoi(text_v) : config.text_v;
+		us_blocking_set_text_color(y, u, v);
+	}
+
+	if (box_y != NULL || box_u != NULL || box_v != NULL || box_alpha != NULL) {
+		us_blocking_config_s config;
+		us_blocking_get_config(&config);
+		u8 y = box_y ? (u8)atoi(box_y) : config.bg_box_y;
+		u8 u = box_u ? (u8)atoi(box_u) : config.bg_box_u;
+		u8 v = box_v ? (u8)atoi(box_v) : config.bg_box_v;
+		u8 alpha = box_alpha ? (u8)atoi(box_alpha) : config.bg_box_alpha;
+		us_blocking_set_box_color(y, u, v, alpha);
+	}
+
+	if (word_y != NULL || word_u != NULL || word_v != NULL) {
+		us_blocking_config_s config;
+		us_blocking_get_config(&config);
+		u8 y = word_y ? (u8)atoi(word_y) : config.color_word_y;
+		u8 u = word_u ? (u8)atoi(word_u) : config.color_word_u;
+		u8 v = word_v ? (u8)atoi(word_v) : config.color_word_v;
+		us_blocking_set_word_color(y, u, v);
+	}
+
+	if (secondary_y != NULL || secondary_u != NULL || secondary_v != NULL) {
+		us_blocking_config_s config;
+		us_blocking_get_config(&config);
+		u8 y = secondary_y ? (u8)atoi(secondary_y) : config.color_secondary_y;
+		u8 u = secondary_u ? (u8)atoi(secondary_u) : config.color_secondary_u;
+		u8 v = secondary_v ? (u8)atoi(secondary_v) : config.color_secondary_v;
+		us_blocking_set_secondary_color(y, u, v);
+	}
+
+	if (enabled != NULL) {
+		bool en = (!strcmp(enabled, "1") || !strcmp(enabled, "true"));
+		us_blocking_enable(en);
+	}
+
+	evhttp_clear_headers(&params);
+
+	// Return updated configuration
+	_http_callback_blocking(request, v_server);
+}
+
+static void _http_callback_blocking_background(struct evhttp_request *request, void *v_server) {
+	us_server_s *const server = v_server;
+
+	PREPROCESS_REQUEST;
+
+	// This endpoint accepts POST with JPEG data
+	if (evhttp_request_get_command(request) != EVHTTP_REQ_POST) {
+		struct evbuffer *buf;
+		_A_EVBUFFER_NEW(buf);
+		_A_EVBUFFER_ADD_PRINTF(buf, "{\"ok\": false, \"error\": \"POST required\"}");
+		_A_ADD_HEADER(request, "Content-Type", "application/json");
+		evhttp_send_reply(request, HTTP_BADMETHOD, "Method Not Allowed", buf);
+		evbuffer_free(buf);
+		return;
+	}
+
+	struct evbuffer *input = evhttp_request_get_input_buffer(request);
+	size_t data_len = evbuffer_get_length(input);
+
+	if (data_len == 0) {
+		struct evbuffer *buf;
+		_A_EVBUFFER_NEW(buf);
+		_A_EVBUFFER_ADD_PRINTF(buf, "{\"ok\": false, \"error\": \"No data provided\"}");
+		_A_ADD_HEADER(request, "Content-Type", "application/json");
+		evhttp_send_reply(request, HTTP_BADREQUEST, "Bad Request", buf);
+		evbuffer_free(buf);
+		return;
+	}
+
+	// Copy data from evbuffer
+	u8 *jpeg_data = (u8*)malloc(data_len);
+	if (jpeg_data == NULL) {
+		struct evbuffer *buf;
+		_A_EVBUFFER_NEW(buf);
+		_A_EVBUFFER_ADD_PRINTF(buf, "{\"ok\": false, \"error\": \"Memory allocation failed\"}");
+		_A_ADD_HEADER(request, "Content-Type", "application/json");
+		evhttp_send_reply(request, HTTP_INTERNAL, "Internal Server Error", buf);
+		evbuffer_free(buf);
+		return;
+	}
+
+	evbuffer_copyout(input, jpeg_data, data_len);
+
+	// Set background
+	int result = us_blocking_set_background_jpeg(jpeg_data, data_len);
+	free(jpeg_data);
+
+	struct evbuffer *buf;
+	_A_EVBUFFER_NEW(buf);
+
+	if (result == 0) {
+		us_blocking_config_s config;
+		us_blocking_get_config(&config);
+		_A_EVBUFFER_ADD_PRINTF(buf,
+			"{\"ok\": true, \"result\": {\"bg_width\": %u, \"bg_height\": %u}}",
+			config.bg_width, config.bg_height);
+		_A_ADD_HEADER(request, "Content-Type", "application/json");
+		evhttp_send_reply(request, HTTP_OK, "OK", buf);
+	} else {
+		_A_EVBUFFER_ADD_PRINTF(buf, "{\"ok\": false, \"error\": \"Failed to decode JPEG\"}");
+		_A_ADD_HEADER(request, "Content-Type", "application/json");
+		evhttp_send_reply(request, HTTP_BADREQUEST, "Bad Request", buf);
+	}
+
+	evbuffer_free(buf);
+}
+
+// Raw snapshot endpoint - returns unmodified video frame even when blocking is active
+// This is used by OCR to detect ad content during blocking mode
+static void _http_callback_snapshot_raw(struct evhttp_request *request, void *v_server) {
+	us_server_s *const server = v_server;
+
+	PREPROCESS_REQUEST;
+
+	// If not blocking or no raw frame available, redirect to regular snapshot
+	if (!us_blocking_is_enabled_fast() || !us_blocking_has_raw_frame()) {
+		// Just do a redirect to /snapshot
+		_A_ADD_HEADER(request, "Location", "/snapshot");
+		evhttp_send_reply(request, HTTP_MOVETEMP, "Temporary Redirect", NULL);
+		return;
+	}
+
+	// Get raw frame data (this locks the mutex)
+	uint width = 0, height = 0, stride = 0;
+	const u8 *raw_data = us_blocking_get_raw_frame(&width, &height, &stride);
+
+	if (raw_data == NULL || width == 0 || height == 0) {
+		us_blocking_release_raw_frame();
+		_A_ADD_HEADER(request, "Location", "/snapshot");
+		evhttp_send_reply(request, HTTP_MOVETEMP, "Temporary Redirect", NULL);
+		return;
+	}
+
+	// Calculate NV12 frame size
+	size_t y_size = stride * height;
+	size_t uv_size = stride * (height / 2);
+	size_t frame_size = y_size + uv_size;
+
+	// CRITICAL: Copy frame data BEFORE releasing mutex to avoid holding it during encoding
+	// This prevents blocking MPP encoder workers from storing new raw frames
+	// Without this, CPU JPEG encoding (~50-100ms) blocks all 4 MPP workers
+	u8 *frame_copy = (u8*)malloc(frame_size);
+	if (frame_copy == NULL) {
+		us_blocking_release_raw_frame();
+		struct evbuffer *buf;
+		_A_EVBUFFER_NEW(buf);
+		_A_EVBUFFER_ADD_PRINTF(buf, "Memory allocation failed");
+		evhttp_send_reply(request, HTTP_INTERNAL, "Internal Server Error", buf);
+		evbuffer_free(buf);
+		return;
+	}
+	memcpy(frame_copy, raw_data, frame_size);
+	uint copy_width = width;
+	uint copy_height = height;
+	uint copy_stride = stride;
+
+	// Release mutex IMMEDIATELY after copying - don't hold during encoding
+	us_blocking_release_raw_frame();
+
+	// Create temporary frame structures for encoding
+	us_frame_s src_frame = {0};
+	us_frame_s dest_frame = {0};
+
+	// Set up source frame (NV12) - using our copied data
+	src_frame.data = frame_copy;
+	src_frame.used = frame_size;
+	src_frame.allocated = frame_size;
+	src_frame.width = copy_width;
+	src_frame.height = copy_height;
+	src_frame.format = V4L2_PIX_FMT_NV12;
+	src_frame.stride = copy_stride;
+	src_frame.online = true;
+	src_frame.key = true;
+
+	// Allocate destination buffer for JPEG (estimate max size)
+	size_t max_jpeg_size = copy_width * copy_height * 3;  // Conservative estimate
+	dest_frame.data = (u8*)malloc(max_jpeg_size);
+	if (dest_frame.data == NULL) {
+		free(frame_copy);
+		struct evbuffer *buf;
+		_A_EVBUFFER_NEW(buf);
+		_A_EVBUFFER_ADD_PRINTF(buf, "Memory allocation failed");
+		evhttp_send_reply(request, HTTP_INTERNAL, "Internal Server Error", buf);
+		evbuffer_free(buf);
+		return;
+	}
+	dest_frame.allocated = max_jpeg_size;
+	dest_frame.used = 0;
+
+	// Encode to JPEG using CPU encoder (quality 80) - mutex no longer held!
+	us_cpu_encoder_compress(&src_frame, &dest_frame, 80);
+
+	// Free the frame copy now that encoding is done
+	free(frame_copy);
+
+	// Check if encoding succeeded
+	if (dest_frame.used == 0) {
+		free(dest_frame.data);
+		struct evbuffer *buf;
+		_A_EVBUFFER_NEW(buf);
+		_A_EVBUFFER_ADD_PRINTF(buf, "JPEG encoding failed");
+		evhttp_send_reply(request, HTTP_INTERNAL, "Internal Server Error", buf);
+		evbuffer_free(buf);
+		return;
+	}
+
+	// Send JPEG response
+	struct evbuffer *buf;
+	_A_EVBUFFER_NEW(buf);
+	evbuffer_add(buf, dest_frame.data, dest_frame.used);
+
+	_A_ADD_HEADER(request, "Content-Type", "image/jpeg");
+	_A_ADD_HEADER(request, "Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, pre-check=0, post-check=0, max-age=0");
+	_A_ADD_HEADER(request, "Pragma", "no-cache");
+	_A_ADD_HEADER(request, "Expires", "Mon, 3 Jan 2000 12:34:56 GMT");
+	_A_ADD_HEADER(request, "X-Raw-Snapshot", "true");
+
+	evhttp_send_reply(request, HTTP_OK, "OK", buf);
+
+	evbuffer_free(buf);
+	free(dest_frame.data);
 }
 
 #undef PREPROCESS_REQUEST

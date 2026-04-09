@@ -12,11 +12,11 @@ _USTR = ustreamer.bin
 _DUMP = ustreamer-dump.bin
 _V4P = ustreamer-v4p.bin
 
-_CFLAGS = -MD -c -std=c17 -Wall -Wextra -D_GNU_SOURCE $(CFLAGS)
+_CFLAGS = -MD -c -std=c17 -Wall -Wextra -D_GNU_SOURCE $(CFLAGS) -I/usr/include/freetype2
 
-_USTR_LDFLAGS = $(LDFLAGS) -lm -ljpeg -pthread -lrt -levent -levent_pthreads
-_DUMP_LDFLAGS = $(LDFLAGS) -lm -ljpeg -pthread -lrt
-_V4P_LDFLAGS = $(LDFLAGS) -lm -ljpeg -pthread -lrt
+_USTR_LDFLAGS = $(LDFLAGS) -lm -ljpeg -pthread -lrt -levent -levent_pthreads -lfreetype
+_DUMP_LDFLAGS = $(LDFLAGS) -lm -ljpeg -pthread -lrt -lfreetype
+_V4P_LDFLAGS = $(LDFLAGS) -lm -ljpeg -pthread -lrt -lfreetype
 
 _USTR_SRCS = $(shell ls \
 	libs/*.c \

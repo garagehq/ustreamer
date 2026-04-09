@@ -31,6 +31,7 @@
 #include "../libs/capture.h"
 #include "../libs/signal.h"
 #include "../libs/overlay.h"
+#include "../libs/blocking.h"
 
 #include "options.h"
 #include "encoder.h"
@@ -93,6 +94,7 @@ int main(int argc, char *argv[]) {
 	if ((exit_code = options_parse(options, cap, enc, _g_stream, _g_server)) == 0) {
 		us_stream_update_blank(_g_stream, cap);
 		us_overlay_init();
+		us_blocking_init();
 #		ifdef WITH_GPIO
 		us_gpio_init();
 #		endif
@@ -117,6 +119,7 @@ int main(int argc, char *argv[]) {
 		us_gpio_destroy();
 #		endif
 		us_overlay_destroy();
+		us_blocking_destroy();
 	}
 
 	us_server_destroy(_g_server);
