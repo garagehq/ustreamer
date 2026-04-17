@@ -696,11 +696,12 @@ static void _help(FILE *fp, const us_capture_s *cap, const us_encoder_s *enc, co
 	SAY("    --device-error-delay <sec>  ────────── Delay before trying to connect to the device again");
 	SAY("                                           after an error (timeout for example). Default: %u.\n", stream->error_delay);
 	SAY("    --m2m-device </dev/path>  ──────────── Path to V4L2 M2M encoder device. Default: auto select.\n");
-	SAY("    --encode-scale <scale>  ─────────────── Set output scaling for CPU encoder. Useful for 4K input.");
+	SAY("    --encode-scale <scale>  ─────────────── Set output scaling for encoder. Useful for 4K input.");
 	SAY("                                           Available: %s; default: native.", ENCODE_SCALE_STR);
-	SAY("                                             * native ──── Auto: downscale 4K NV12 to 1080p, others unchanged;");
-	SAY("                                             * 1080p ───── Force 1080p (1920x1080) output;");
-	SAY("                                             * 2k ────────  Force 2K (2560x1440) output.\n");
+	SAY("                                             * native ────── Auto: downscale 4K NV12 to 1080p, others unchanged;");
+	SAY("                                             * 1080p ─────── Force 1080p (1920x1080) output;");
+	SAY("                                             * 2k ────────── Force 2K (2560x1440) output;");
+	SAY("                                             * passthrough ─ No scaling, use source resolution directly.\n");
 	SAY("Image control options:");
 	SAY("══════════════════════");
 	SAY("    --image-default  ────────────────────── Reset all image settings below to default. Default: no change.\n");

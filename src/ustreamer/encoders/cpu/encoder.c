@@ -94,8 +94,8 @@ void us_cpu_encoder_compress(const us_frame_s *src, us_frame_s *dest, uint quali
 					downscale_nv12 = true;
 				}
 				break;
-			case US_ENCODE_SCALE_4K:
-				// Force 4K output (no downscaling)
+			case US_ENCODE_SCALE_PASSTHROUGH:
+				// Passthrough: no scaling, use source resolution directly
 				break;
 			case US_ENCODE_SCALE_NATIVE:
 			default:

@@ -547,8 +547,8 @@ static void _get_target_resolution(const us_frame_s *src, uint *target_width, ui
 			*target_width = 2560;
 			*target_height = 1440;
 			break;
-		case US_ENCODE_SCALE_4K:
-			// Force 4K output (no downscaling)
+		case US_ENCODE_SCALE_PASSTHROUGH:
+			// Passthrough: no scaling, use source resolution directly
 			*target_width = src->width;
 			*target_height = src->height;
 			break;

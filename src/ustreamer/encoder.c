@@ -57,9 +57,11 @@ static const struct {
 	{"2k",			US_ENCODE_SCALE_2K},
 	{"1440p",		US_ENCODE_SCALE_2K},
 	{"1440",		US_ENCODE_SCALE_2K},
-	{"4k",			US_ENCODE_SCALE_4K},
-	{"2160p",		US_ENCODE_SCALE_4K},
-	{"2160",		US_ENCODE_SCALE_4K},
+	{"passthrough",	US_ENCODE_SCALE_PASSTHROUGH},
+	{"none",		US_ENCODE_SCALE_PASSTHROUGH},
+	{"4k",			US_ENCODE_SCALE_PASSTHROUGH},  // Deprecated alias
+	{"2160p",		US_ENCODE_SCALE_PASSTHROUGH},  // Deprecated alias
+	{"2160",		US_ENCODE_SCALE_PASSTHROUGH},  // Deprecated alias
 };
 
 static const struct {
@@ -155,7 +157,7 @@ const char *us_encoder_scale_to_string(us_encode_scale_e scale) {
 		case US_ENCODE_SCALE_NATIVE: return "native";
 		case US_ENCODE_SCALE_1080P: return "1080p";
 		case US_ENCODE_SCALE_2K: return "2k";
-		case US_ENCODE_SCALE_4K: return "4k";
+		case US_ENCODE_SCALE_PASSTHROUGH: return "passthrough";
 		default: return "native";
 	}
 }
