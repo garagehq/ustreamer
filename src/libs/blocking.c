@@ -111,7 +111,8 @@ static void _draw_scaled_nv12(
     uint dst_x, uint dst_y_pos,
     uint dst_width, uint dst_height,
     uint dst_y_stride, uint dst_uv_stride,
-    uint frame_width, uint frame_height
+    uint frame_width, uint frame_height,
+    bool grayscale
 );
 
 // FreeType text rendering functions
@@ -234,6 +235,7 @@ void us_blocking_init(void) {
     us_g_blocking->config.enabled = false;
     us_g_blocking->config.bg_valid = false;
     us_g_blocking->config.preview_enabled = false;
+    us_g_blocking->config.preview_grayscale = false;
 
     // Initialize atomic enabled flag
     atomic_store(&us_g_blocking->enabled_fast, false);
@@ -450,6 +452,17 @@ void us_blocking_set_preview(int x, int y, uint w, uint h, bool enabled) {
     _LOG_DEBUG("Preview set: pos=(%d,%d) size=%ux%u enabled=%d", x, y, w, h, enabled);
 }
 
+void us_blocking_set_preview_grayscale(bool grayscale) {
+    if (us_g_blocking == NULL) return;
+
+    US_MUTEX_LOCK(us_g_blocking->mutex);
+    us_g_blocking->config.preview_grayscale = grayscale;
+    us_g_blocking->dirty = true;
+    US_MUTEX_UNLOCK(us_g_blocking->mutex);
+
+    _LOG_DEBUG("Preview grayscale: %d", grayscale);
+}
+
 void us_blocking_set_text_vocab(const char *text) {
     if (us_g_blocking == NULL) return;
 
@@ -577,6 +590,7 @@ void us_blocking_get_config(us_blocking_config_s *config) {
     config->preview_w = us_g_blocking->config.preview_w;
     config->preview_h = us_g_blocking->config.preview_h;
     config->preview_enabled = us_g_blocking->config.preview_enabled;
+    config->preview_grayscale = us_g_blocking->config.preview_grayscale;
     memcpy(config->text_vocab, us_g_blocking->config.text_vocab, US_BLOCKING_TEXT_VOCAB_SIZE);
     memcpy(config->text_stats, us_g_blocking->config.text_stats, US_BLOCKING_TEXT_STATS_SIZE);
     config->text_vocab_scale = us_g_blocking->config.text_vocab_scale;
@@ -1088,6 +1102,9 @@ static void _ft_draw_vocab_multicolor(
 }
 
 // Scale and copy NV12 frame (for preview window)
+// If grayscale is true, the UV plane is zeroed to 128/128 (neutral chroma),
+// which renders the copied region as greyscale without touching luma — the ad
+// is still visible but much less eye-catching than the blocking overlay.
 static void _draw_scaled_nv12(
     const u8 *src_y, const u8 *src_uv,
     uint src_width, uint src_height,
@@ -1096,7 +1113,8 @@ static void _draw_scaled_nv12(
     uint dst_x, uint dst_y_pos,
     uint dst_width, uint dst_height,
     uint dst_y_stride, uint dst_uv_stride,
-    uint frame_width, uint frame_height) {
+    uint frame_width, uint frame_height,
+    bool grayscale) {
 
     // Fixed-point scale factors
     uint scale_x = (src_width << 16) / dst_width;
@@ -1142,8 +1160,15 @@ static void _draw_scaled_nv12(
             uint dst_idx = py * dst_uv_stride + px;
             uint src_idx = sy * src_uv_stride + sx;
 
-            dst_uv[dst_idx] = src_uv[src_idx];
-            dst_uv[dst_idx + 1] = src_uv[src_idx + 1];
+            if (grayscale) {
+                // Neutral chroma = no color. Luma (Y plane) is left alone so
+                // the preview is still visible, just desaturated.
+                dst_uv[dst_idx] = 128;
+                dst_uv[dst_idx + 1] = 128;
+            } else {
+                dst_uv[dst_idx] = src_uv[src_idx];
+                dst_uv[dst_idx + 1] = src_uv[src_idx + 1];
+            }
         }
     }
 }
@@ -1177,7 +1202,8 @@ static void _copy_background_nv12(
             0, 0,  // Start at top-left
             dst_width, dst_height,
             dst_y_stride, dst_uv_stride,
-            dst_width, dst_height
+            dst_width, dst_height,
+            false  // never grayscale the background
         );
     }
 }
@@ -1206,6 +1232,7 @@ void us_blocking_composite_nv12(
     config.preview_w = us_g_blocking->config.preview_w;
     config.preview_h = us_g_blocking->config.preview_h;
     config.preview_enabled = us_g_blocking->config.preview_enabled;
+    config.preview_grayscale = us_g_blocking->config.preview_grayscale;
     memcpy(config.text_vocab, us_g_blocking->config.text_vocab, US_BLOCKING_TEXT_VOCAB_SIZE);
     memcpy(config.text_stats, us_g_blocking->config.text_stats, US_BLOCKING_TEXT_STATS_SIZE);
     config.text_vocab_scale = us_g_blocking->config.text_vocab_scale;
@@ -1308,7 +1335,8 @@ void us_blocking_composite_nv12(
             preview_x, preview_y,
             preview_w, preview_h,
             dst_y_stride, dst_uv_stride,
-            dst_width, dst_height
+            dst_width, dst_height,
+            config.preview_grayscale
         );
 
         // Draw border around preview (white)

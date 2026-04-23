@@ -52,6 +52,7 @@ typedef struct {
     uint        preview_w;          // Preview width
     uint        preview_h;          // Preview height
     bool        preview_enabled;    // Show preview window
+    bool        preview_grayscale;  // Desaturate preview (ad looks less appealing)
 
     // Text overlays
     char        text_vocab[US_BLOCKING_TEXT_VOCAB_SIZE];   // Spanish vocabulary
@@ -98,6 +99,9 @@ int us_blocking_set_background_jpeg(const u8 *jpeg_data, size_t jpeg_size);
 
 // Set preview window position and size
 void us_blocking_set_preview(int x, int y, uint w, uint h, bool enabled);
+
+// Set preview greyscale (desaturates chroma in the preview region)
+void us_blocking_set_preview_grayscale(bool grayscale);
 
 // Set text overlays
 void us_blocking_set_text_vocab(const char *text);

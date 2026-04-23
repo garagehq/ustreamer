@@ -805,7 +805,7 @@ static void _http_callback_blocking(struct evhttp_request *request, void *v_serv
 		" \"bg_valid\": %s,"
 		" \"bg_width\": %u,"
 		" \"bg_height\": %u,"
-		" \"preview\": {\"enabled\": %s, \"x\": %d, \"y\": %d, \"w\": %u, \"h\": %u},"
+		" \"preview\": {\"enabled\": %s, \"x\": %d, \"y\": %d, \"w\": %u, \"h\": %u, \"grayscale\": %s},"
 		" \"text_vocab_scale\": %u,"
 		" \"text_stats_scale\": %u,"
 		" \"text_color\": {\"y\": %u, \"u\": %u, \"v\": %u},"
@@ -822,6 +822,7 @@ static void _http_callback_blocking(struct evhttp_request *request, void *v_serv
 		config.preview_y,
 		config.preview_w,
 		config.preview_h,
+		us_bool_to_string(config.preview_grayscale),
 		config.text_vocab_scale,
 		config.text_stats_scale,
 		config.text_y, config.text_u, config.text_v,
@@ -855,6 +856,7 @@ static void _http_callback_blocking_set(struct evhttp_request *request, void *v_
 	const char *preview_w = evhttp_find_header(&params, "preview_w");
 	const char *preview_h = evhttp_find_header(&params, "preview_h");
 	const char *preview_enabled = evhttp_find_header(&params, "preview_enabled");
+	const char *preview_grayscale = evhttp_find_header(&params, "preview_grayscale");
 	const char *text_y = evhttp_find_header(&params, "text_y");
 	const char *text_u = evhttp_find_header(&params, "text_u");
 	const char *text_v = evhttp_find_header(&params, "text_v");
@@ -899,6 +901,11 @@ static void _http_callback_blocking_set(struct evhttp_request *request, void *v_
 		uint ph = preview_h ? (uint)atoi(preview_h) : config.preview_h;
 		bool pe = preview_enabled ? (!strcmp(preview_enabled, "1") || !strcmp(preview_enabled, "true")) : config.preview_enabled;
 		us_blocking_set_preview(px, py, pw, ph, pe);
+	}
+
+	if (preview_grayscale != NULL) {
+		bool pg = (!strcmp(preview_grayscale, "1") || !strcmp(preview_grayscale, "true"));
+		us_blocking_set_preview_grayscale(pg);
 	}
 
 	if (text_y != NULL || text_u != NULL || text_v != NULL) {
