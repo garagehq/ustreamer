@@ -34,6 +34,7 @@
 // Maximum text buffer sizes
 #define US_BLOCKING_TEXT_VOCAB_SIZE    1024
 #define US_BLOCKING_TEXT_STATS_SIZE    512
+#define US_BLOCKING_TEXT_OCR_SIZE      256   // Top-right OCR trigger snippet (~50 chars + UTF-8)
 #define US_BLOCKING_MAX_BG_SIZE        (3840 * 2160 * 3 / 2)  // Max 4K NV12
 
 // Blocking mode configuration
@@ -57,6 +58,7 @@ typedef struct {
     // Text overlays
     char        text_vocab[US_BLOCKING_TEXT_VOCAB_SIZE];   // Spanish vocabulary
     char        text_stats[US_BLOCKING_TEXT_STATS_SIZE];   // Debug stats
+    char        text_ocr[US_BLOCKING_TEXT_OCR_SIZE];       // Top-right OCR trigger snippet
     uint        text_vocab_scale;   // Vocabulary text scale (1-15, default 6)
     uint        text_stats_scale;   // Stats text scale (1-10, default 2)
 
@@ -106,6 +108,7 @@ void us_blocking_set_preview_grayscale(bool grayscale);
 // Set text overlays
 void us_blocking_set_text_vocab(const char *text);
 void us_blocking_set_text_stats(const char *text);
+void us_blocking_set_text_ocr(const char *text);
 void us_blocking_set_text_vocab_scale(uint scale);
 void us_blocking_set_text_stats_scale(uint scale);
 

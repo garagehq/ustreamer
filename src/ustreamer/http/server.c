@@ -849,6 +849,7 @@ static void _http_callback_blocking_set(struct evhttp_request *request, void *v_
 	const char *clear = evhttp_find_header(&params, "clear");
 	const char *text_vocab = evhttp_find_header(&params, "text_vocab");
 	const char *text_stats = evhttp_find_header(&params, "text_stats");
+	const char *text_ocr = evhttp_find_header(&params, "text_ocr");
 	const char *text_vocab_scale = evhttp_find_header(&params, "text_vocab_scale");
 	const char *text_stats_scale = evhttp_find_header(&params, "text_stats_scale");
 	const char *preview_x = evhttp_find_header(&params, "preview_x");
@@ -882,6 +883,10 @@ static void _http_callback_blocking_set(struct evhttp_request *request, void *v_
 
 	if (text_stats != NULL) {
 		us_blocking_set_text_stats(text_stats);
+	}
+
+	if (text_ocr != NULL) {
+		us_blocking_set_text_ocr(text_ocr);
 	}
 
 	if (text_vocab_scale != NULL) {

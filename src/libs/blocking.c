@@ -491,6 +491,20 @@ void us_blocking_set_text_stats(const char *text) {
     US_MUTEX_UNLOCK(us_g_blocking->mutex);
 }
 
+void us_blocking_set_text_ocr(const char *text) {
+    if (us_g_blocking == NULL) return;
+
+    US_MUTEX_LOCK(us_g_blocking->mutex);
+    if (text != NULL) {
+        strncpy(us_g_blocking->config.text_ocr, text, US_BLOCKING_TEXT_OCR_SIZE - 1);
+        us_g_blocking->config.text_ocr[US_BLOCKING_TEXT_OCR_SIZE - 1] = '\0';
+    } else {
+        us_g_blocking->config.text_ocr[0] = '\0';
+    }
+    us_g_blocking->dirty = true;
+    US_MUTEX_UNLOCK(us_g_blocking->mutex);
+}
+
 void us_blocking_set_text_vocab_scale(uint scale) {
     if (us_g_blocking == NULL) return;
     if (scale < 1) scale = 1;
@@ -570,6 +584,7 @@ void us_blocking_clear(void) {
     us_g_blocking->config.preview_enabled = false;
     us_g_blocking->config.text_vocab[0] = '\0';
     us_g_blocking->config.text_stats[0] = '\0';
+    us_g_blocking->config.text_ocr[0] = '\0';
     us_g_blocking->dirty = true;
     US_MUTEX_UNLOCK(us_g_blocking->mutex);
 
@@ -593,6 +608,7 @@ void us_blocking_get_config(us_blocking_config_s *config) {
     config->preview_grayscale = us_g_blocking->config.preview_grayscale;
     memcpy(config->text_vocab, us_g_blocking->config.text_vocab, US_BLOCKING_TEXT_VOCAB_SIZE);
     memcpy(config->text_stats, us_g_blocking->config.text_stats, US_BLOCKING_TEXT_STATS_SIZE);
+    memcpy(config->text_ocr, us_g_blocking->config.text_ocr, US_BLOCKING_TEXT_OCR_SIZE);
     config->text_vocab_scale = us_g_blocking->config.text_vocab_scale;
     config->text_stats_scale = us_g_blocking->config.text_stats_scale;
     config->text_y = us_g_blocking->config.text_y;
@@ -1235,6 +1251,7 @@ void us_blocking_composite_nv12(
     config.preview_grayscale = us_g_blocking->config.preview_grayscale;
     memcpy(config.text_vocab, us_g_blocking->config.text_vocab, US_BLOCKING_TEXT_VOCAB_SIZE);
     memcpy(config.text_stats, us_g_blocking->config.text_stats, US_BLOCKING_TEXT_STATS_SIZE);
+    memcpy(config.text_ocr, us_g_blocking->config.text_ocr, US_BLOCKING_TEXT_OCR_SIZE);
     config.text_vocab_scale = us_g_blocking->config.text_vocab_scale;
     config.text_stats_scale = us_g_blocking->config.text_stats_scale;
     config.text_y = us_g_blocking->config.text_y;
@@ -1379,7 +1396,8 @@ void us_blocking_composite_nv12(
     // Step 3: Draw vocabulary text (centered both horizontally and vertically)
     // CRITICAL: FreeType is NOT thread-safe, must serialize access from multiple encoder workers
     bool need_ft = _ft_initialized && ((_ft_face_vocab && config.text_vocab[0] != '\0') ||
-                                        (_ft_face_stats && config.text_stats[0] != '\0'));
+                                        (_ft_face_stats && (config.text_stats[0] != '\0' ||
+                                                            config.text_ocr[0] != '\0')));
     if (need_ft) {
         pthread_mutex_lock(&_ft_mutex);
     }
@@ -1463,6 +1481,44 @@ void us_blocking_composite_nv12(
                 dst_width, dst_height,
                 text_x, text_y,
                 config.text_stats, config.text_stats_scale,
+                config.text_y, config.text_u, config.text_v,
+                true, config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
+            );
+        }
+    }
+
+    // Step 5: Draw OCR trigger text (top-right, same scale/font as stats)
+    if (config.text_ocr[0] != '\0') {
+        uint font_size = config.text_stats_scale * FONT_BASE_SIZE;
+        FT_Face face = _ft_face_stats;
+
+        uint text_w, text_h;
+        if (face && _ft_initialized) {
+            _ft_calc_text_size(config.text_ocr, face, font_size, &text_w, &text_h);
+        } else {
+            _calc_text_size(config.text_ocr, config.text_stats_scale, &text_w, &text_h);
+        }
+
+        int text_x = (int)dst_width - (int)text_w - 30;
+        int text_y = 30;
+
+        if (text_x < 10) text_x = 10;
+
+        if (face && _ft_initialized) {
+            _ft_draw_text_nv12(
+                dst_y, dst_uv, dst_y_stride, dst_uv_stride,
+                dst_width, dst_height,
+                text_x, text_y,
+                config.text_ocr, face, font_size,
+                config.text_y, config.text_u, config.text_v,
+                true, config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
+            );
+        } else {
+            _draw_text_nv12(
+                dst_y, dst_uv, dst_y_stride, dst_uv_stride,
+                dst_width, dst_height,
+                text_x, text_y,
+                config.text_ocr, config.text_stats_scale,
                 config.text_y, config.text_u, config.text_v,
                 true, config.bg_box_y, config.bg_box_u, config.bg_box_v, config.bg_box_alpha
             );
