@@ -362,6 +362,16 @@ static void _draw_rect_nv12(
 	}
 }
 
+bool us_overlay_is_enabled(void) {
+	if (us_g_overlay == NULL) {
+		return false;
+	}
+	US_MUTEX_LOCK(us_g_overlay->mutex);
+	const bool enabled = us_g_overlay->config.enabled;
+	US_MUTEX_UNLOCK(us_g_overlay->mutex);
+	return enabled;
+}
+
 void us_overlay_draw_nv12(
 	u8 *y_plane, u8 *uv_plane,
 	uint width, uint height,

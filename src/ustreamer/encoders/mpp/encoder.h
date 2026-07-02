@@ -60,6 +60,34 @@ typedef struct {
 
 	// State
 	bool			ready;
+
+	// Zero-copy DMABUF import cache: one MppBuffer per V4L2 capture buffer
+	// fd. Imports are cheap but not free; V4L2 fds are stable for the life
+	// of the capture session, so cache them.
+#	define US_MPP_MAX_IMPORTS 16
+	struct {
+		int			fd;
+		MppBuffer	buf;
+	}				imports[US_MPP_MAX_IMPORTS];
+	uint			n_imports;
+
+	// Set permanently after any zero-copy failure -> always use copy path
+	bool			zero_copy_broken;
+
+	// RGA import handle cache for the hardware NV24/BGR24 -> NV12 paths.
+	// Handles are ints to keep rga headers out of this header.
+#	define US_MPP_MAX_RGA_HANDLES 24
+	struct {
+		int			fd;
+		uint		w;
+		uint		h;
+		uint		fmt;
+		int			handle;
+	}				rga_handles[US_MPP_MAX_RGA_HANDLES];
+	uint			n_rga_handles;
+
+	// Set permanently after any RGA failure -> always use CPU copy path
+	bool			rga_broken;
 } us_mpp_encoder_s;
 
 

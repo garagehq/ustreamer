@@ -96,6 +96,15 @@ override _USTR_SRCS += $(shell ls ustreamer/encoders/mpp/*.c 2>/dev/null)
 $(info -- MPP hardware encoder support enabled)
 endif
 
+# Auto-detect Rockchip RGA 2D accelerator library (hardware colorspace
+# conversion for the MPP encoder fast paths: NV24/BGR24 -> NV12)
+_HAS_RGA := $(shell test -e /usr/include/rga/im2d.h -a -e /usr/lib/aarch64-linux-gnu/librga.so && echo 1)
+ifeq ($(_HAS_MPP)$(_HAS_RGA),11)
+override _CFLAGS += -DWITH_RGA
+override _USTR_LDFLAGS += -lrga
+$(info -- RGA hardware CSC support enabled)
+endif
+
 ifneq ($(MK_WITH_V4P),)
 override _TARGETS += $(_V4P)
 override _OBJS += $(_V4P_SRCS:%.c=$(_BUILD)/%.o)
