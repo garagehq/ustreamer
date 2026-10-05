@@ -61,12 +61,15 @@ typedef struct {
 	// State
 	bool			ready;
 
-	// Zero-copy DMABUF import cache: one MppBuffer per V4L2 capture buffer
-	// fd. Imports are cheap but not free; V4L2 fds are stable for the life
-	// of the capture session, so cache them.
+	// Zero-copy DMABUF import cache: one MppBuffer per V4L2 capture buffer.
+	// Keyed by fd AND the dmabuf inode: with --persistent, a signal loss
+	// restarts capture inside the same process, the new buffers often get
+	// the same fd numbers, and an fd-only cache kept encoding the old
+	// buffers' contents forever (a frozen/looping stale picture).
 #	define US_MPP_MAX_IMPORTS 16
 	struct {
 		int			fd;
+		unsigned long long ino;
 		MppBuffer	buf;
 	}				imports[US_MPP_MAX_IMPORTS];
 	uint			n_imports;
@@ -86,6 +89,7 @@ typedef struct {
 #	define US_MPP_MAX_RGA_HANDLES 24
 	struct {
 		int			fd;
+		unsigned long long ino;  // see imports[] above
 		uint		w;
 		uint		h;
 		uint		fmt;

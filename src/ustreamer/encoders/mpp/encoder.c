@@ -27,6 +27,7 @@
 #include "encoder.h"
 
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <assert.h>
 #include <stdatomic.h>
@@ -47,6 +48,8 @@
 #include "../../../libs/blocking.h"
 
 #include "../../encoder.h"  // For us_g_encode_scale
+
+static unsigned long long _fd_ino(int fd);
 
 #ifdef WITH_RGA
 #include <rga/im2d.h>
@@ -467,15 +470,25 @@ static int _compress_rga_scale(us_mpp_encoder_s *enc, const us_frame_s *src, us_
 }
 
 static int _rga_get_handle(us_mpp_encoder_s *enc, int fd, uint w, uint h, uint fmt) {
+	const unsigned long long ino = _fd_ino(fd);
+	int slot = -1;
 	for (uint i = 0; i < enc->n_rga_handles; ++i) {
 		if (enc->rga_handles[i].fd == fd
 			&& enc->rga_handles[i].w == w
 			&& enc->rga_handles[i].h == h
 			&& enc->rga_handles[i].fmt == fmt) {
-			return enc->rga_handles[i].handle;
+			if (enc->rga_handles[i].ino == ino) {
+				return enc->rga_handles[i].handle;
+			}
+			// Same fd number, different buffer: capture was restarted.
+			_LOG_INFO("RGA: fd=%d now refers to a new buffer; re-importing", fd);
+			releasebuffer_handle(enc->rga_handles[i].handle);
+			enc->rga_handles[i].handle = 0;
+			slot = i;
+			break;
 		}
 	}
-	if (enc->n_rga_handles >= US_MPP_MAX_RGA_HANDLES) {
+	if (slot < 0 && enc->n_rga_handles >= US_MPP_MAX_RGA_HANDLES) {
 		_LOG_ERROR("RGA: Handle cache full");
 		return 0;
 	}
@@ -485,12 +498,16 @@ static int _rga_get_handle(us_mpp_encoder_s *enc, int fd, uint w, uint h, uint f
 		_LOG_ERROR("RGA: Failed to import fd=%d (%ux%u fmt=0x%x)", fd, w, h, fmt);
 		return 0;
 	}
-	enc->rga_handles[enc->n_rga_handles].fd = fd;
-	enc->rga_handles[enc->n_rga_handles].w = w;
-	enc->rga_handles[enc->n_rga_handles].h = h;
-	enc->rga_handles[enc->n_rga_handles].fmt = fmt;
-	enc->rga_handles[enc->n_rga_handles].handle = handle;
-	enc->n_rga_handles += 1;
+	if (slot < 0) {
+		slot = enc->n_rga_handles;
+		enc->n_rga_handles += 1;
+	}
+	enc->rga_handles[slot].fd = fd;
+	enc->rga_handles[slot].ino = ino;
+	enc->rga_handles[slot].w = w;
+	enc->rga_handles[slot].h = h;
+	enc->rga_handles[slot].fmt = fmt;
+	enc->rga_handles[slot].handle = handle;
 	_LOG_INFO("RGA: Imported fd=%d as %ux%u fmt=0x%x (%u cached)", fd, w, h, fmt, enc->n_rga_handles);
 	return handle;
 }
@@ -508,11 +525,32 @@ static void _release_rga_handles(us_mpp_encoder_s *enc) {
 
 #endif // WITH_RGA
 
+// Identity of the buffer behind a dmabuf fd. fd numbers are recycled when
+// capture restarts; the dmabuf inode is not.
+static unsigned long long _fd_ino(int fd) {
+	struct stat st;
+	return (fstat(fd, &st) == 0 ? (unsigned long long)st.st_ino : 0);
+}
+
 static MppBuffer _get_imported_buffer(us_mpp_encoder_s *enc, int fd, size_t size) {
+	const unsigned long long ino = _fd_ino(fd);
+	int slot = -1;
 	for (uint i = 0; i < enc->n_imports; ++i) {
 		if (enc->imports[i].fd == fd) {
-			return enc->imports[i].buf;
+			if (enc->imports[i].ino == ino) {
+				return enc->imports[i].buf;
+			}
+			// Same fd number, different buffer: capture was restarted.
+			_LOG_INFO("ZC: fd=%d now refers to a new buffer; re-importing", fd);
+			mpp_buffer_put(enc->imports[i].buf);
+			enc->imports[i].buf = NULL;
+			slot = i;
+			break;
 		}
+	}
+	if (slot < 0 && enc->n_imports >= US_MPP_MAX_IMPORTS) {
+		_LOG_ERROR("ZC: Import cache full");
+		return NULL;
 	}
 	if (enc->n_imports >= US_MPP_MAX_IMPORTS) {
 		_LOG_ERROR("ZC: Import cache full");
@@ -531,9 +569,13 @@ static MppBuffer _get_imported_buffer(us_mpp_encoder_s *enc, int fd, size_t size
 		_LOG_ERROR("ZC: Failed to import DMABUF fd=%d: %d", fd, ret);
 		return NULL;
 	}
-	enc->imports[enc->n_imports].fd = fd;
-	enc->imports[enc->n_imports].buf = buf;
-	enc->n_imports += 1;
+	if (slot < 0) {
+		slot = enc->n_imports;
+		enc->n_imports += 1;
+	}
+	enc->imports[slot].fd = fd;
+	enc->imports[slot].ino = ino;
+	enc->imports[slot].buf = buf;
 	_LOG_INFO("ZC: Imported V4L2 DMABUF fd=%d size=%zu (%u cached)", fd, size, enc->n_imports);
 	return buf;
 }
