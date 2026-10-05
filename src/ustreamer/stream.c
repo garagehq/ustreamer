@@ -353,7 +353,11 @@ static void *_jpeg_thread(void *v_ctx) {
 		}
 
 		const ldf now_ts = us_get_now_monotonic();
-		if (now_ts < grab_after_ts) {
+		// With --desired-fps capping, accept a frame up to a quarter
+		// interval early so capture jitter can't push it to the next one.
+		const ldf desired_interval = stream->enc->run->pool->desired_interval;
+		const ldf fluency_slack = (desired_interval > 0 ? desired_interval / 4 : 0);
+		if (now_ts < grab_after_ts - fluency_slack) {
 			fluency_passed += 1;
 			US_LOG_VERBOSE("JPEG: Passed %u frames for fluency: now=%.03Lf, grab_after=%.03Lf",
 				fluency_passed, now_ts, grab_after_ts);
@@ -363,7 +367,18 @@ static void *_jpeg_thread(void *v_ctx) {
 		fluency_passed = 0;
 
 		const ldf fluency_delay = us_workers_pool_get_fluency_delay(stream->enc->run->pool, wr);
-		grab_after_ts = now_ts + fluency_delay;
+		if (desired_interval > 0 && fluency_delay == desired_interval) {
+			// FPS cap: keep a fixed schedule (previous slot + interval)
+			// instead of now + interval. With a 60fps source and a 30fps
+			// cap, now + 33.3ms always fell a hair after the next-but-one
+			// frame, so every third frame was taken: 20fps, not 30.
+			grab_after_ts += fluency_delay;
+			if (grab_after_ts < now_ts) {
+				grab_after_ts = now_ts + fluency_delay; // fell behind: resync
+			}
+		} else {
+			grab_after_ts = now_ts + fluency_delay;
+		}
 		US_LOG_VERBOSE("JPEG: Fluency: delay=%.03Lf, grab_after=%.03Lf", fluency_delay, grab_after_ts);
 
 		job->hw = hw;
