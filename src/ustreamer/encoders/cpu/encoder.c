@@ -78,6 +78,13 @@ void us_cpu_encoder_compress(const us_frame_s *src, us_frame_s *dest, uint quali
 
 	if (src->format == V4L2_PIX_FMT_NV12) {
 		switch (us_g_encode_scale) {
+			case US_ENCODE_SCALE_720P:
+				if (src->height > 720) {
+					target_width = 1280;
+					target_height = 720;
+					downscale_nv12 = true;
+				}
+				break;
 			case US_ENCODE_SCALE_1080P:
 				// Force 1080p output
 				if (src->height > 1080) {

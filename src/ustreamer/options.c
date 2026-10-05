@@ -700,7 +700,8 @@ static void _help(FILE *fp, const us_capture_s *cap, const us_encoder_s *enc, co
 	SAY("                                           Available: %s; default: native.", ENCODE_SCALE_STR);
 	SAY("                                             * native ────── Auto: downscale 4K NV12 to 1080p, others unchanged;");
 	SAY("                                             * 1080p ─────── Force 1080p (1920x1080) output;");
-	SAY("                                             * 2k ────────── Force 2K (2560x1440) output;");
+	SAY("                                             * 720p ──────── Cap at 720p (1280x720);");
+	SAY("                                             * 2k ────────── Cap at 2K (2560x1440); never upscales;");
 	SAY("                                             * passthrough ─ No scaling, use source resolution directly.\n");
 	SAY("Image control options:");
 	SAY("══════════════════════");

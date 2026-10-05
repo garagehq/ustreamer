@@ -52,6 +52,8 @@ static const struct {
 } _ENCODE_SCALES[] = {
 	{"native",		US_ENCODE_SCALE_NATIVE},
 	{"auto",		US_ENCODE_SCALE_NATIVE},
+	{"720p",		US_ENCODE_SCALE_720P},
+	{"720",			US_ENCODE_SCALE_720P},
 	{"1080p",		US_ENCODE_SCALE_1080P},
 	{"1080",		US_ENCODE_SCALE_1080P},
 	{"2k",			US_ENCODE_SCALE_2K},
@@ -155,6 +157,7 @@ int us_encoder_parse_scale(const char *str) {
 const char *us_encoder_scale_to_string(us_encode_scale_e scale) {
 	switch (scale) {
 		case US_ENCODE_SCALE_NATIVE: return "native";
+		case US_ENCODE_SCALE_720P: return "720p";
 		case US_ENCODE_SCALE_1080P: return "1080p";
 		case US_ENCODE_SCALE_2K: return "2k";
 		case US_ENCODE_SCALE_PASSTHROUGH: return "passthrough";

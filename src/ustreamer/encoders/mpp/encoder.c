@@ -80,7 +80,8 @@ static void _release_imported_buffers(us_mpp_encoder_s *enc);
 static int _encode_buffer(us_mpp_encoder_s *enc, MppBuffer mbuf, us_frame_s *dest);
 #ifdef WITH_RGA
 static int _compress_rga(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_s *dest);
-static int _rga_convert_to_frame_buf(us_mpp_encoder_s *enc, const us_frame_s *src);
+static int _rga_convert_to_buf(us_mpp_encoder_s *enc, const us_frame_s *src, int dst_fd, uint hs, uint vs);
+static int _compress_rga_scale(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_s *dest, uint tw, uint th);
 static int _rga_get_handle(us_mpp_encoder_s *enc, int fd, uint w, uint h, uint fmt);
 static void _release_rga_handles(us_mpp_encoder_s *enc);
 #endif
@@ -163,6 +164,29 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 			}
 			_LOG_INFO("RGA-assisted encode failed; falling back to CPU path permanently");
 			enc->rga_broken = true;
+		}
+	}
+
+	// RGA RESIZE PATH: --encode-scale below the source size (e.g. 4K -> 2K)
+	// used to fall through to the CPU nearest-neighbour downscaler, which
+	// reads every pixel from uncached V4L2 memory. RGA resizes DMA-to-DMA
+	// (converting NV24/BGR24 to NV12 on the way).
+	if (!enc->rga_scale_broken
+		&& (src->format == V4L2_PIX_FMT_NV12
+			|| src->format == V4L2_PIX_FMT_NV24
+			|| src->format == V4L2_PIX_FMT_BGR24)
+		&& src->dma_fd >= 0
+		&& !us_blocking_is_enabled_fast()
+		&& !us_overlay_is_enabled()) {
+
+		uint target_width, target_height;
+		_get_target_resolution(src, &target_width, &target_height);
+		if (target_width != src->width || target_height != src->height) {
+			if (_compress_rga_scale(enc, src, dest, target_width, target_height) == 0) {
+				return 0;
+			}
+			_LOG_INFO("RGA resize encode failed; falling back to CPU path permanently");
+			enc->rga_scale_broken = true;
 		}
 	}
 #endif
@@ -264,7 +288,12 @@ static int _compress_rga(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_
 	if (!enc->ready) {
 		return -1;
 	}
-	if (_rga_convert_to_frame_buf(enc, src) < 0) {
+	const int frame_fd = mpp_buffer_get_fd(enc->frame_buf);
+	if (frame_fd < 0) {
+		_LOG_ERROR("RGA: Failed to get frame_buf fd");
+		return -1;
+	}
+	if (_rga_convert_to_buf(enc, src, frame_fd, enc->hor_stride, enc->ver_stride) < 0) {
 		return -1;
 	}
 
@@ -278,18 +307,12 @@ static int _compress_rga(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_
 	return 0;
 }
 
-static int _rga_convert_to_frame_buf(us_mpp_encoder_s *enc, const us_frame_s *src) {
+// Converts src (NV24 or BGR24, same size) to NV12 in the DMABUF dst_fd,
+// laid out with strides hs x vs.
+static int _rga_convert_to_buf(us_mpp_encoder_s *enc, const us_frame_s *src, int dst_fd, uint hs, uint vs) {
 	const uint width = src->width;
 	const uint height = src->height;
-	const uint hs = enc->hor_stride;
-	const uint vs = enc->ver_stride;
 	const uint sstride = (src->stride > 0 ? src->stride : width);
-
-	const int dst_fd = mpp_buffer_get_fd(enc->frame_buf);
-	if (dst_fd < 0) {
-		_LOG_ERROR("RGA: Failed to get frame_buf fd");
-		return -1;
-	}
 
 	if (src->format == V4L2_PIX_FMT_BGR24) {
 		// Direct hardware colorspace conversion (measured ~2ms @1080p)
@@ -355,6 +378,91 @@ static int _rga_convert_to_frame_buf(us_mpp_encoder_s *enc, const us_frame_s *sr
 		_LOG_ERROR("RGA: NV24 UV downscale failed: %s", imStrError(ret));
 		return -1;
 	}
+	return 0;
+}
+
+static int _compress_rga_scale(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_s *dest, uint tw, uint th) {
+	if (_mpp_encoder_prepare(enc, tw, th, V4L2_PIX_FMT_NV12,
+			MPP_ALIGN(tw, 16), MPP_ALIGN(th, 16)) < 0) {
+		return -1;
+	}
+	if (!enc->ready) {
+		return -1;
+	}
+	const int dst_fd = mpp_buffer_get_fd(enc->frame_buf);
+	if (dst_fd < 0) {
+		_LOG_ERROR("RGA resize: Failed to get frame_buf fd");
+		return -1;
+	}
+
+	int src_fd = src->dma_fd;
+	uint wstride, hstride;
+	int fmt;
+	if (src->format == V4L2_PIX_FMT_NV24) {
+		// RGA cannot read YUV444SP: convert to a full-size NV12 scratch
+		// buffer first (same two-pass trick as the CSC path), then resize.
+		const uint shs = MPP_ALIGN(src->width, 16);
+		const uint svs = MPP_ALIGN(src->height, 16);
+		const size_t need = (size_t)shs * svs * 3 / 2;
+		if (enc->scale_buf == NULL || enc->scale_buf_size < need) {
+			if (enc->scale_buf != NULL) {
+				mpp_buffer_put(enc->scale_buf);
+				enc->scale_buf = NULL;
+			}
+			if (mpp_buffer_get(enc->buf_grp, &enc->scale_buf, need) != MPP_OK) {
+				_LOG_ERROR("RGA resize: Failed to allocate %zu-byte scratch buffer", need);
+				enc->scale_buf = NULL;
+				return -1;
+			}
+			enc->scale_buf_size = need;
+			_LOG_INFO("RGA resize: Allocated %ux%u NV12 scratch buffer", shs, svs);
+		}
+		src_fd = mpp_buffer_get_fd(enc->scale_buf);
+		if (src_fd < 0 || _rga_convert_to_buf(enc, src, src_fd, shs, svs) < 0) {
+			return -1;
+		}
+		wstride = shs;
+		hstride = svs;
+		fmt = RK_FORMAT_YCbCr_420_SP;
+	} else if (src->format == V4L2_PIX_FMT_BGR24) {
+		wstride = (src->stride > 0 ? src->stride / 3 : src->width);
+		hstride = src->height;
+		fmt = RK_FORMAT_BGR_888;
+	} else {
+		wstride = (src->stride > 0 ? src->stride : src->width);
+		hstride = src->height;
+		fmt = RK_FORMAT_YCbCr_420_SP;
+	}
+
+	const int sh = _rga_get_handle(enc, src_fd, wstride, hstride, fmt);
+	const int dh = _rga_get_handle(enc, dst_fd, enc->hor_stride, enc->ver_stride, RK_FORMAT_YCbCr_420_SP);
+	if (sh == 0 || dh == 0) {
+		return -1;
+	}
+	rga_buffer_t s = wrapbuffer_handle_t(sh, src->width, src->height, wstride, hstride, fmt);
+	rga_buffer_t d = wrapbuffer_handle_t(dh, tw, th, enc->hor_stride, enc->ver_stride, RK_FORMAT_YCbCr_420_SP);
+	rga_buffer_t pat;
+	memset(&pat, 0, sizeof(pat));
+	im_rect srect = { 0, 0, (int)src->width, (int)src->height };
+	im_rect drect = { 0, 0, (int)tw, (int)th };
+	im_rect prect;
+	memset(&prect, 0, sizeof(prect));
+	// Scale and (for BGR24) colour-convert in one pass.
+	const int ret = improcess(s, d, pat, srect, drect, prect, IM_SYNC);
+	if (ret != IM_STATUS_SUCCESS) {
+		_LOG_ERROR("RGA resize %ux%u -> %ux%u failed: %s",
+			src->width, src->height, tw, th, imStrError(ret));
+		return -1;
+	}
+
+	us_frame_encoding_begin(src, dest, V4L2_PIX_FMT_JPEG);
+	if (_encode_buffer(enc, enc->frame_buf, dest) < 0) {
+		return -1;
+	}
+	us_frame_encoding_end(dest);
+	_LOG_VERBOSE("RGA resize: %ux%u -> %ux%u, %zu bytes, time=%0.3Lf",
+		src->width, src->height, tw, th, dest->used,
+		dest->encode_end_ts - dest->encode_begin_ts);
 	return 0;
 }
 
@@ -819,6 +927,12 @@ static void _mpp_encoder_cleanup(us_mpp_encoder_s *enc) {
 		enc->frame_buf = NULL;
 	}
 
+	if (enc->scale_buf != NULL) {
+		mpp_buffer_put(enc->scale_buf);
+		enc->scale_buf = NULL;
+		enc->scale_buf_size = 0;
+	}
+
 	if (enc->buf_grp != NULL) {
 		mpp_buffer_group_put(enc->buf_grp);
 		enc->buf_grp = NULL;
@@ -900,6 +1014,10 @@ static void _copy_nv12_aligned(const u8 *src_data, uint src_width, uint src_heig
 static void _get_target_resolution(const us_frame_s *src, uint *target_width, uint *target_height) {
 	// Check the global encode scale setting
 	switch (us_g_encode_scale) {
+		case US_ENCODE_SCALE_720P:
+			*target_width = 1280;
+			*target_height = 720;
+			break;
 		case US_ENCODE_SCALE_1080P:
 			*target_width = 1920;
 			*target_height = 1080;

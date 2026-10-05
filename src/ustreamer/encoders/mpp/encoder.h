@@ -74,6 +74,13 @@ typedef struct {
 	// Set permanently after any zero-copy failure -> always use copy path
 	bool			zero_copy_broken;
 
+	// RGA resize path (--encode-scale below the source size): full-size
+	// NV12 scratch buffer for sources RGA cannot resize directly (NV24),
+	// and a permanent fallback flag like zero_copy_broken.
+	MppBuffer		scale_buf;
+	size_t			scale_buf_size;
+	bool			rga_scale_broken;
+
 	// RGA import handle cache for the hardware NV24/BGR24 -> NV12 paths.
 	// Handles are ints to keep rga headers out of this header.
 #	define US_MPP_MAX_RGA_HANDLES 24
