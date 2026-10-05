@@ -83,7 +83,10 @@ int main(int argc, char *argv[]) {
 	int exit_code = 0;
 
 	US_LOGGING_INIT;
-	US_THREAD_RENAME("main");
+	// Name the main thread after the program, not "main": on Linux the
+	// main thread's name is the process name (comm), so "main" made
+	// `pkill ustreamer` miss the process and left stale instances running.
+	US_THREAD_RENAME("ustreamer");
 
 	us_options_s *options = us_options_init(argc, argv);
 	us_capture_s *cap = us_capture_init();
