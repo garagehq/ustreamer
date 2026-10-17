@@ -48,6 +48,11 @@
 
 #include "../../encoder.h"  // For us_g_encode_scale
 
+#ifdef WITH_RGA
+#include <rga/im2d.h>
+#include <rga/rga.h>
+#endif
+
 
 #define _LOG_ERROR(x_msg, ...)   US_LOG_ERROR("MPP %s: " x_msg, enc->name, ##__VA_ARGS__)
 #define _LOG_PERROR(x_msg, ...)  US_LOG_PERROR("MPP %s: " x_msg, enc->name, ##__VA_ARGS__)
@@ -66,7 +71,19 @@ static _Atomic uint _raw_frame_counter = 0;
 
 
 static void _mpp_encoder_cleanup(us_mpp_encoder_s *enc);
-static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, uint width, uint height, uint format);
+static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, uint width, uint height, uint format,
+                                uint hor_stride, uint ver_stride);
+static int _compress_copy(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_s *dest);
+static int _compress_zero_copy(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_s *dest);
+static MppBuffer _get_imported_buffer(us_mpp_encoder_s *enc, int fd, size_t size);
+static void _release_imported_buffers(us_mpp_encoder_s *enc);
+static int _encode_buffer(us_mpp_encoder_s *enc, MppBuffer mbuf, us_frame_s *dest);
+#ifdef WITH_RGA
+static int _compress_rga(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_s *dest);
+static int _rga_convert_to_frame_buf(us_mpp_encoder_s *enc, const us_frame_s *src);
+static int _rga_get_handle(us_mpp_encoder_s *enc, int fd, uint w, uint h, uint fmt);
+static void _release_rga_handles(us_mpp_encoder_s *enc);
+#endif
 static MppFrameFormat _v4l2_to_mpp_format(uint v4l2_format);
 static void _get_target_resolution(const us_frame_s *src, uint *target_width, uint *target_height);
 static void _copy_nv12_aligned(const u8 *src_data, uint src_width, uint src_height,
@@ -101,6 +118,330 @@ void us_mpp_encoder_destroy(us_mpp_encoder_s *enc) {
 }
 
 int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_s *dest) {
+	// ZERO-COPY FAST PATH: when no pixel modification is needed (no blocking
+	// composite, no notification overlay, no scaling/format conversion) and
+	// the source carries an exported DMABUF fd, hand the V4L2 buffer straight
+	// to the VPU. The copy path below reads every pixel from UNCACHED V4L2
+	// mmap memory on the CPU — measured ~90ms per 1080p frame (15x the actual
+	// ~5ms VPU encode) — which was the root cause of the pipeline capping at
+	// half the capture rate (60 -> 27-30 fps).
+	if (!enc->zero_copy_broken
+		&& src->format == V4L2_PIX_FMT_NV12
+		&& src->dma_fd >= 0
+		&& !us_blocking_is_enabled_fast()
+		&& !us_overlay_is_enabled()) {
+
+		uint target_width, target_height;
+		_get_target_resolution(src, &target_width, &target_height);
+		if (target_width == src->width && target_height == src->height) {
+			if (_compress_zero_copy(enc, src, dest) == 0) {
+				return 0;
+			}
+			_LOG_INFO("Zero-copy encode failed; falling back to copy path permanently");
+			enc->zero_copy_broken = true;
+		}
+	}
+
+#ifdef WITH_RGA
+	// RGA HARDWARE CSC FAST PATH: NV24 (1080p YCbCr 4:4:4 sources like Roku)
+	// and BGR24 (Google TV) need conversion to NV12 for the VEPU. The CPU
+	// converters below read every pixel from UNCACHED V4L2 memory (~90ms per
+	// 1080p NV24 frame). The RGA 2D block does the same conversion in ~2.4ms
+	// DMA-to-DMA. Requires the exported DMABUF fd; pixel-modifying features
+	// (blocking composite, notification overlay) still use the CPU path.
+	if (!enc->rga_broken
+		&& (src->format == V4L2_PIX_FMT_NV24 || src->format == V4L2_PIX_FMT_BGR24)
+		&& src->dma_fd >= 0
+		&& !us_blocking_is_enabled_fast()
+		&& !us_overlay_is_enabled()) {
+
+		uint target_width, target_height;
+		_get_target_resolution(src, &target_width, &target_height);
+		if (target_width == src->width && target_height == src->height) {
+			if (_compress_rga(enc, src, dest) == 0) {
+				return 0;
+			}
+			_LOG_INFO("RGA-assisted encode failed; falling back to CPU path permanently");
+			enc->rga_broken = true;
+		}
+	}
+#endif
+
+	return _compress_copy(enc, src, dest);
+}
+
+static int _compress_zero_copy(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_s *dest) {
+	MPP_RET ret;
+
+	// The V4L2 single-planar NV12 layout puts the UV plane at
+	// stride * height, so ver_stride MUST be the exact height (2160 and
+	// 1080 both satisfy the VEPU's 8-alignment).
+	const uint hs = (src->stride > 0 ? src->stride : src->width);
+	const uint vs = src->height;
+
+	if (_mpp_encoder_prepare(enc, src->width, src->height, V4L2_PIX_FMT_NV12, hs, vs) < 0) {
+		return -1;
+	}
+	if (!enc->ready) {
+		return -1;
+	}
+
+	MppBuffer mbuf = _get_imported_buffer(enc, src->dma_fd, (size_t)hs * vs * 3 / 2);
+	if (mbuf == NULL) {
+		return -1;
+	}
+
+	us_frame_encoding_begin(src, dest, V4L2_PIX_FMT_JPEG);
+	if (_encode_buffer(enc, mbuf, dest) < 0) {
+		return -1;
+	}
+	us_frame_encoding_end(dest);
+	_LOG_VERBOSE("ZC: Compressed frame: %zu bytes, time=%0.3Lf",
+		dest->used, dest->encode_end_ts - dest->encode_begin_ts);
+	return 0;
+}
+
+// Encode one already-populated NV12 MppBuffer into dest using the encoder's
+// current configuration. Shared by the zero-copy and RGA fast paths.
+static int _encode_buffer(us_mpp_encoder_s *enc, MppBuffer mbuf, us_frame_s *dest) {
+	MPP_RET ret;
+
+	MppFrame mpp_frame = NULL;
+	ret = mpp_frame_init(&mpp_frame);
+	if (ret != MPP_OK) {
+		_LOG_ERROR("EB: Failed to init MPP frame: %d", ret);
+		return -1;
+	}
+	mpp_frame_set_width(mpp_frame, enc->width);
+	mpp_frame_set_height(mpp_frame, enc->height);
+	mpp_frame_set_hor_stride(mpp_frame, enc->hor_stride);
+	mpp_frame_set_ver_stride(mpp_frame, enc->ver_stride);
+	mpp_frame_set_fmt(mpp_frame, enc->mpp_format);
+	mpp_frame_set_eos(mpp_frame, 0);
+	mpp_frame_set_buffer(mpp_frame, mbuf);
+
+	MppPacket mpp_packet = NULL;
+	ret = enc->mpi->encode_put_frame(enc->mpp_ctx, mpp_frame);
+	if (ret != MPP_OK) {
+		_LOG_ERROR("EB: Failed to put frame: %d", ret);
+		mpp_frame_deinit(&mpp_frame);
+		return -1;
+	}
+	ret = enc->mpi->encode_get_packet(enc->mpp_ctx, &mpp_packet);
+	if (ret != MPP_OK || mpp_packet == NULL) {
+		_LOG_ERROR("EB: Failed to get packet: %d", ret);
+		mpp_frame_deinit(&mpp_frame);
+		return -1;
+	}
+
+	void *pkt_ptr = mpp_packet_get_pos(mpp_packet);
+	size_t pkt_len = mpp_packet_get_length(mpp_packet);
+	if (pkt_ptr == NULL || pkt_len == 0) {
+		_LOG_ERROR("EB: Empty packet received");
+		mpp_packet_deinit(&mpp_packet);
+		mpp_frame_deinit(&mpp_frame);
+		return -1;
+	}
+	us_frame_set_data(dest, pkt_ptr, pkt_len);
+	dest->key = true;
+	dest->gop = 0;
+
+	mpp_packet_deinit(&mpp_packet);
+	mpp_frame_deinit(&mpp_frame);
+	return 0;
+}
+
+#ifdef WITH_RGA
+
+static int _compress_rga(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_s *dest) {
+	// The VEPU consumes NV12 from enc->frame_buf with 16-aligned strides
+	// (identical geometry to the CPU copy path, so blocking-mode transitions
+	// reuse the same encoder configuration).
+	if (_mpp_encoder_prepare(enc, src->width, src->height, V4L2_PIX_FMT_NV12,
+			MPP_ALIGN(src->width, 16), MPP_ALIGN(src->height, 16)) < 0) {
+		return -1;
+	}
+	if (!enc->ready) {
+		return -1;
+	}
+	if (_rga_convert_to_frame_buf(enc, src) < 0) {
+		return -1;
+	}
+
+	us_frame_encoding_begin(src, dest, V4L2_PIX_FMT_JPEG);
+	if (_encode_buffer(enc, enc->frame_buf, dest) < 0) {
+		return -1;
+	}
+	us_frame_encoding_end(dest);
+	_LOG_VERBOSE("RGA: Compressed frame: %zu bytes, time=%0.3Lf",
+		dest->used, dest->encode_end_ts - dest->encode_begin_ts);
+	return 0;
+}
+
+static int _rga_convert_to_frame_buf(us_mpp_encoder_s *enc, const us_frame_s *src) {
+	const uint width = src->width;
+	const uint height = src->height;
+	const uint hs = enc->hor_stride;
+	const uint vs = enc->ver_stride;
+	const uint sstride = (src->stride > 0 ? src->stride : width);
+
+	const int dst_fd = mpp_buffer_get_fd(enc->frame_buf);
+	if (dst_fd < 0) {
+		_LOG_ERROR("RGA: Failed to get frame_buf fd");
+		return -1;
+	}
+
+	if (src->format == V4L2_PIX_FMT_BGR24) {
+		// Direct hardware colorspace conversion (measured ~2ms @1080p)
+		const int sh = _rga_get_handle(enc, src->dma_fd, width, height, RK_FORMAT_BGR_888);
+		const int dh = _rga_get_handle(enc, dst_fd, hs, vs, RK_FORMAT_YCbCr_420_SP);
+		if (sh == 0 || dh == 0) {
+			return -1;
+		}
+		rga_buffer_t s = wrapbuffer_handle_t(sh, width, height, sstride / 3 > 0 ? sstride / 3 : width, height, RK_FORMAT_BGR_888);
+		rga_buffer_t d = wrapbuffer_handle_t(dh, width, height, hs, vs, RK_FORMAT_YCbCr_420_SP);
+		const int ret = imcvtcolor(s, d, RK_FORMAT_BGR_888, RK_FORMAT_YCbCr_420_SP);
+		if (ret != IM_STATUS_SUCCESS) {
+			_LOG_ERROR("RGA: BGR24 imcvtcolor failed: %s", imStrError(ret));
+			return -1;
+		}
+		return 0;
+	}
+
+	// NV24 -> NV12 in two hardware passes. The RGA has no YUV444SP support,
+	// so both passes reinterpret the planes as RGBA byte layouts:
+	//  Pass 1 (Y):  W x H bytes == RGBA image W/4 x H -> plain DMA copy.
+	//  Pass 2 (UV): the NV24 UV plane (2W bytes/row, H rows) viewed as RGBA
+	//    W/2 x H, each pixel = [U0 V0 U1 V1]. A 2x2 bilinear downscale to
+	//    W/4 x H/2 averages each byte channel independently, producing
+	//    exactly the NV12 UV plane layout (W bytes/row, H/2 rows). Chroma
+	//    pairing differs subtly from the CPU reference (averages columns
+	//    {x, x+2} instead of {x, x+1}) — visually indistinguishable after
+	//    4:2:0 subsampling (validated: mean |diff| 0.18 on gradients).
+	//
+	// Both planes address the same DMABUFs through "canvas" views (full
+	// buffer as one tall RGBA image) with im_rects selecting the plane:
+	//  src canvas A (Y):  sstride/4 px wide, 3H rows;  Y = rows [0, H)
+	//  src canvas B (UV): sstride/2 px wide, 3H/2 rows; UV = rows [H/2, 3H/2)
+	//  dst canvas    :    hs/4 px wide, vs*3/2 rows;   Y = rows [0, H), UV = rows [vs, vs + H/2)
+
+	const int sha = _rga_get_handle(enc, src->dma_fd, sstride / 4, height * 3, RK_FORMAT_RGBA_8888);
+	const int shb = _rga_get_handle(enc, src->dma_fd, sstride / 2, (height * 3) / 2, RK_FORMAT_RGBA_8888);
+	const int dhc = _rga_get_handle(enc, dst_fd, hs / 4, (vs * 3) / 2, RK_FORMAT_RGBA_8888);
+	if (sha == 0 || shb == 0 || dhc == 0) {
+		return -1;
+	}
+
+	rga_buffer_t src_y = wrapbuffer_handle_t(sha, sstride / 4, height * 3, sstride / 4, height * 3, RK_FORMAT_RGBA_8888);
+	rga_buffer_t src_uv = wrapbuffer_handle_t(shb, sstride / 2, (height * 3) / 2, sstride / 2, (height * 3) / 2, RK_FORMAT_RGBA_8888);
+	rga_buffer_t dst_c = wrapbuffer_handle_t(dhc, hs / 4, (vs * 3) / 2, hs / 4, (vs * 3) / 2, RK_FORMAT_RGBA_8888);
+	rga_buffer_t pat; memset(&pat, 0, sizeof(pat));
+	im_rect prect; memset(&prect, 0, sizeof(prect));
+
+	// Pass 1: Y plane copy
+	im_rect sy_rect = { 0, 0, (int)(width / 4), (int)height };
+	im_rect dy_rect = { 0, 0, (int)(width / 4), (int)height };
+	int ret = improcess(src_y, dst_c, pat, sy_rect, dy_rect, prect, IM_SYNC);
+	if (ret != IM_STATUS_SUCCESS) {
+		_LOG_ERROR("RGA: NV24 Y copy failed: %s", imStrError(ret));
+		return -1;
+	}
+
+	// Pass 2: UV plane 2x2 downscale
+	im_rect suv_rect = { 0, (int)(height / 2), (int)(width / 2), (int)height };
+	im_rect duv_rect = { 0, (int)vs, (int)(width / 4), (int)(height / 2) };
+	ret = improcess(src_uv, dst_c, pat, suv_rect, duv_rect, prect, IM_SYNC);
+	if (ret != IM_STATUS_SUCCESS) {
+		_LOG_ERROR("RGA: NV24 UV downscale failed: %s", imStrError(ret));
+		return -1;
+	}
+	return 0;
+}
+
+static int _rga_get_handle(us_mpp_encoder_s *enc, int fd, uint w, uint h, uint fmt) {
+	for (uint i = 0; i < enc->n_rga_handles; ++i) {
+		if (enc->rga_handles[i].fd == fd
+			&& enc->rga_handles[i].w == w
+			&& enc->rga_handles[i].h == h
+			&& enc->rga_handles[i].fmt == fmt) {
+			return enc->rga_handles[i].handle;
+		}
+	}
+	if (enc->n_rga_handles >= US_MPP_MAX_RGA_HANDLES) {
+		_LOG_ERROR("RGA: Handle cache full");
+		return 0;
+	}
+	im_handle_param_t param = { w, h, fmt };
+	const rga_buffer_handle_t handle = importbuffer_fd(fd, &param);
+	if (handle == 0) {
+		_LOG_ERROR("RGA: Failed to import fd=%d (%ux%u fmt=0x%x)", fd, w, h, fmt);
+		return 0;
+	}
+	enc->rga_handles[enc->n_rga_handles].fd = fd;
+	enc->rga_handles[enc->n_rga_handles].w = w;
+	enc->rga_handles[enc->n_rga_handles].h = h;
+	enc->rga_handles[enc->n_rga_handles].fmt = fmt;
+	enc->rga_handles[enc->n_rga_handles].handle = handle;
+	enc->n_rga_handles += 1;
+	_LOG_INFO("RGA: Imported fd=%d as %ux%u fmt=0x%x (%u cached)", fd, w, h, fmt, enc->n_rga_handles);
+	return handle;
+}
+
+static void _release_rga_handles(us_mpp_encoder_s *enc) {
+	for (uint i = 0; i < enc->n_rga_handles; ++i) {
+		if (enc->rga_handles[i].handle != 0) {
+			releasebuffer_handle(enc->rga_handles[i].handle);
+			enc->rga_handles[i].handle = 0;
+		}
+		enc->rga_handles[i].fd = -1;
+	}
+	enc->n_rga_handles = 0;
+}
+
+#endif // WITH_RGA
+
+static MppBuffer _get_imported_buffer(us_mpp_encoder_s *enc, int fd, size_t size) {
+	for (uint i = 0; i < enc->n_imports; ++i) {
+		if (enc->imports[i].fd == fd) {
+			return enc->imports[i].buf;
+		}
+	}
+	if (enc->n_imports >= US_MPP_MAX_IMPORTS) {
+		_LOG_ERROR("ZC: Import cache full");
+		return NULL;
+	}
+
+	MppBufferInfo info;
+	memset(&info, 0, sizeof(info));
+	info.type = MPP_BUFFER_TYPE_EXT_DMA;
+	info.fd = fd;
+	info.size = size;
+
+	MppBuffer buf = NULL;
+	MPP_RET ret = mpp_buffer_import(&buf, &info);
+	if (ret != MPP_OK || buf == NULL) {
+		_LOG_ERROR("ZC: Failed to import DMABUF fd=%d: %d", fd, ret);
+		return NULL;
+	}
+	enc->imports[enc->n_imports].fd = fd;
+	enc->imports[enc->n_imports].buf = buf;
+	enc->n_imports += 1;
+	_LOG_INFO("ZC: Imported V4L2 DMABUF fd=%d size=%zu (%u cached)", fd, size, enc->n_imports);
+	return buf;
+}
+
+static void _release_imported_buffers(us_mpp_encoder_s *enc) {
+	for (uint i = 0; i < enc->n_imports; ++i) {
+		if (enc->imports[i].buf != NULL) {
+			mpp_buffer_put(enc->imports[i].buf);
+			enc->imports[i].buf = NULL;
+		}
+		enc->imports[i].fd = -1;
+	}
+	enc->n_imports = 0;
+}
+
+static int _compress_copy(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_s *dest) {
 	MPP_RET ret;
 
 	us_frame_encoding_begin(src, dest, V4L2_PIX_FMT_JPEG);
@@ -120,7 +461,8 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 
 	// Ensure encoder is configured for target dimensions
 	// Always use NV12 format for MPP since that's what the hardware supports reliably
-	if (_mpp_encoder_prepare(enc, target_width, target_height, encoder_format) < 0) {
+	if (_mpp_encoder_prepare(enc, target_width, target_height, encoder_format,
+			MPP_ALIGN(target_width, 16), MPP_ALIGN(target_height, 16)) < 0) {
 		_LOG_ERROR("Failed to prepare encoder");
 		return -1;
 	}
@@ -156,9 +498,7 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 		return -1;
 	}
 
-	// Clear buffer to avoid artifacts from padding areas
 	size_t buf_size = mpp_buffer_get_size(enc->frame_buf);
-	memset(buf_ptr, 0, buf_size);
 
 	if (needs_nv24_conversion) {
 		// Convert NV24 to NV12 for MPP encoder
@@ -292,7 +632,8 @@ int us_mpp_encoder_compress(us_mpp_encoder_s *enc, const us_frame_s *src, us_fra
 	return 0;
 }
 
-static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, uint width, uint height, uint format) {
+static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, uint width, uint height, uint format,
+                                uint hor_stride, uint ver_stride) {
 	MppFrameFormat mpp_format = _v4l2_to_mpp_format(format);
 
 	if (mpp_format == MPP_FMT_BUTT) {
@@ -304,12 +645,14 @@ static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, uint width, uint height, 
 	if (enc->ready &&
 		enc->width == width &&
 		enc->height == height &&
+		enc->hor_stride == hor_stride &&
+		enc->ver_stride == ver_stride &&
 		enc->mpp_format == mpp_format) {
 		return 0;  // Already configured
 	}
 
-	_LOG_INFO("Configuring encoder for %ux%u format=0x%08x ...",
-		width, height, format);
+	_LOG_INFO("Configuring encoder for %ux%u stride=%ux%u format=0x%08x ...",
+		width, height, hor_stride, ver_stride, format);
 
 	// Cleanup existing configuration
 	_mpp_encoder_cleanup(enc);
@@ -321,9 +664,11 @@ static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, uint width, uint height, 
 	enc->height = height;
 	enc->mpp_format = mpp_format;
 
-	// Calculate strides (16-byte aligned for MPP)
-	enc->hor_stride = MPP_ALIGN(width, 16);
-	enc->ver_stride = MPP_ALIGN(height, 16);
+	// Strides are caller-provided: the copy path uses 16-aligned strides for
+	// its own buffer; the zero-copy path must match the V4L2 buffer layout
+	// exactly (bytesperline x height).
+	enc->hor_stride = hor_stride;
+	enc->ver_stride = ver_stride;
 
 	// Create MPP context
 	ret = mpp_create(&enc->mpp_ctx, &enc->mpi);
@@ -418,6 +763,17 @@ static int _mpp_encoder_prepare(us_mpp_encoder_s *enc, uint width, uint height, 
 		goto error;
 	}
 
+	// Clear the buffer ONCE here so stride-padding areas encode as black.
+	// The visible region is fully overwritten every frame by the copy/convert
+	// helpers and padding never changes, so the previous per-frame memset in
+	// the compress path (3MB @1080p / 12MB @4K of pure CPU waste per frame)
+	// was unnecessary.
+	void *init_ptr = mpp_buffer_get_ptr(enc->frame_buf);
+	if (init_ptr != NULL) {
+		memset(init_ptr, 0, frame_size);
+		mpp_buffer_sync_end(enc->frame_buf);
+	}
+
 	// Allocate packet buffer (output JPEG, estimate max size)
 	size_t pkt_size = enc->width * enc->height;  // Conservative estimate
 	ret = mpp_buffer_get(enc->buf_grp, &enc->pkt_buf, pkt_size);
@@ -447,6 +803,11 @@ error:
 
 static void _mpp_encoder_cleanup(us_mpp_encoder_s *enc) {
 	enc->ready = false;
+
+	_release_imported_buffers(enc);
+#ifdef WITH_RGA
+	_release_rga_handles(enc);
+#endif
 
 	if (enc->pkt_buf != NULL) {
 		mpp_buffer_put(enc->pkt_buf);

@@ -86,6 +86,10 @@ typedef struct {
 	us_encoder_s		*enc;
 	us_capture_hwbuf_s	*hw;
 	us_frame_s			*dest;
+	// Set when the worker already decref'd the capture buffer at the end
+	// of the job (early release). The dispatcher must then skip its own
+	// decref and must NOT touch *hw (the buffer may be back in V4L2).
+	bool				hw_released;
 } us_encoder_job_s;
 
 

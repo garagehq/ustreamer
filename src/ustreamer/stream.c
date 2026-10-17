@@ -291,7 +291,7 @@ static void *_releaser_thread(void *v_ctx) {
 			if (atomic_load(ctx->stop)) {
 				goto done;
 			}
-			usleep(5 * 1000);
+			usleep(1 * 1000); // 1ms: 5ms polling added up to a third of a 60fps frame interval
 		}
 
 		US_MUTEX_LOCK(*ctx->mutex);
@@ -320,7 +320,11 @@ static void *_jpeg_thread(void *v_ctx) {
 		us_encoder_job_s *const job = wr->job;
 
 		if (job->hw != NULL) {
-			us_capture_hwbuf_decref(job->hw);
+			if (!job->hw_released) {
+				us_capture_hwbuf_decref(job->hw); // Legacy path (encoder didn't early-release)
+			}
+			// NOTE: if hw_released, *job->hw may already be back in V4L2 —
+			// the pointer is only used as a "result pending" marker here.
 			job->hw = NULL;
 			if (wr->job_failed) {
 				// pass
@@ -363,6 +367,7 @@ static void *_jpeg_thread(void *v_ctx) {
 		US_LOG_VERBOSE("JPEG: Fluency: delay=%.03Lf, grab_after=%.03Lf", fluency_delay, grab_after_ts);
 
 		job->hw = hw;
+		job->hw_released = false;
 		us_workers_pool_assign(stream->enc->run->pool, wr);
 		US_LOG_DEBUG("JPEG: Assigned new frame in buffer=%d to worker=%s", hw->buf.index, wr->name);
 	}
@@ -548,6 +553,9 @@ static int _stream_init_loop(us_stream_s *stream) {
 		stream->cap->dma_export = (
 			stream->enc->type == US_ENCODER_TYPE_M2M_VIDEO
 			|| stream->enc->type == US_ENCODER_TYPE_M2M_IMAGE
+#			ifdef WITH_MPP
+			|| stream->enc->type == US_ENCODER_TYPE_MPP_IMAGE // Zero-copy V4L2 -> VPU
+#			endif
 			|| stream->h264_sink != NULL
 #			ifdef WITH_V4P
 			|| stream->drm != NULL

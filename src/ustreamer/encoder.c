@@ -309,9 +309,21 @@ static bool _worker_run_job(us_worker_s *wr) {
 		job->dest->encode_end_ts - job->dest->encode_begin_ts,
 		wr->name,
 		job->hw->buf.index);
+
+	// EARLY RELEASE: the encoded JPEG is fully copied into job->dest, so the
+	// V4L2 capture buffer is no longer needed. The stock flow deferred this
+	// decref until the dispatcher next picked this worker (several dispatch
+	// slots later, >100ms measured), which pinned n_workers buffers
+	// permanently, starved V4L2 of free buffers and locked capture to half
+	// rate (60 -> 30 fps). Releasing here returns the buffer within the
+	// encode time (~6ms @1080p) instead.
+	us_capture_hwbuf_decref(job->hw);
+	job->hw_released = true;
 	return true;
 
 error:
 	US_LOG_ERROR("Compression failed: worker=%s, buffer=%u", wr->name, job->hw->buf.index);
+	us_capture_hwbuf_decref(job->hw);
+	job->hw_released = true;
 	return false;
 }

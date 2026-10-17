@@ -87,6 +87,9 @@ void us_overlay_get_config(us_overlay_config_s *config);
 
 // Draw overlay onto NV12 frame buffer
 // This is called by the MPP encoder before encoding
+// Cheap check for the encoder fast-path decision: is the overlay visible?
+bool us_overlay_is_enabled(void);
+
 void us_overlay_draw_nv12(
 	u8 *y_plane,		// Pointer to Y plane
 	u8 *uv_plane,		// Pointer to UV plane (interleaved)
