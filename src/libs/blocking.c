@@ -60,6 +60,7 @@ static uint _raw_frame_stride = 0;
 static size_t _raw_frame_size = 0;
 static pthread_mutex_t _raw_frame_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool _raw_frame_valid = false;
+static double _raw_frame_ts = 0;  // us_get_now_monotonic() at the last store
 static void _raw_frame_cleanup(void);  // Forward declaration
 
 // Font paths
@@ -1563,6 +1564,7 @@ void us_blocking_store_raw_frame(const u8 *data, uint width, uint height, uint s
     _raw_frame_height = height;
     _raw_frame_stride = stride;
     _raw_frame_valid = true;
+    _raw_frame_ts = (double)us_get_now_monotonic();
 
     pthread_mutex_unlock(&_raw_frame_mutex);
 }
@@ -1588,6 +1590,18 @@ const u8 *us_blocking_get_raw_frame(uint *width, uint *height, uint *stride) {
 // Release raw frame mutex (call after us_blocking_get_raw_frame)
 void us_blocking_release_raw_frame(void) {
     pthread_mutex_unlock(&_raw_frame_mutex);
+}
+
+// Seconds since the raw frame was last stored (1e9 when there is none).
+// The raw frame is only refreshed while the encoder is encoding; with no
+// stream client (no display attached) nothing drives the encoder during a
+// block, and /snapshot/raw used to hand OCR/VLM the same frame for minutes.
+double us_blocking_raw_frame_age(void) {
+    pthread_mutex_lock(&_raw_frame_mutex);
+    const double age = (_raw_frame_valid && _raw_frame_buf != NULL)
+        ? (double)us_get_now_monotonic() - _raw_frame_ts : 1e9;
+    pthread_mutex_unlock(&_raw_frame_mutex);
+    return age;
 }
 
 // Check if raw frame is available

@@ -63,11 +63,14 @@
 // Align macro for MPP buffer alignment
 #define MPP_ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
-// Raw frame storage rate limiting: only store every N frames to reduce memcpy overhead
-// OCR/VLM capture at 2s intervals during blocking (see capture.py _MIN_CAPTURE_INTERVAL_BLOCKING)
-// so we only need ~1fps updates - every 60 frames at 60fps is sufficient
-#define RAW_FRAME_UPDATE_INTERVAL 60
-static _Atomic uint _raw_frame_counter = 0;
+// Raw frame storage rate limiting: refresh the /snapshot/raw frame at most
+// every RAW_FRAME_MIN_AGE_S. This used to be every 60th ENCODED frame, which is
+// ~2 s at 30 fps with a display attached and never when frames are only
+// encoded on demand (no display: one encode per /snapshot request, and
+// /snapshot/raw doesn't encode) - OCR/VLM then judged a minutes-old frame and
+// ended real ad blocks as "OCR false positives". Time-based keeps the copy
+// cost bounded (~2.5 x 12 MB/s at 4K) whatever the encode rate.
+#define RAW_FRAME_MIN_AGE_S 0.4
 
 
 static void _mpp_encoder_cleanup(us_mpp_encoder_s *enc);
@@ -541,8 +544,7 @@ static int _compress_copy(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame
 		// Store raw frame BEFORE compositing for /snapshot/raw endpoint
 		// Only update every N frames to reduce ~12MB memcpy overhead
 		// OCR/VLM don't need 60fps - 2fps (every 30 frames) is plenty
-		uint frame_count = atomic_fetch_add(&_raw_frame_counter, 1);
-		if (frame_count % RAW_FRAME_UPDATE_INTERVAL == 0) {
+		if (us_blocking_raw_frame_age() >= RAW_FRAME_MIN_AGE_S) {
 			us_blocking_store_raw_frame((u8*)buf_ptr, enc->width, enc->height, enc->hor_stride);
 		}
 
