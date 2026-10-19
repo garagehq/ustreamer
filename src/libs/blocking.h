@@ -152,3 +152,6 @@ void us_blocking_release_raw_frame(void);
 
 // Check if raw frame is available
 bool us_blocking_has_raw_frame(void);
+
+// Seconds since the raw frame was last stored (1e9 when there is none)
+double us_blocking_raw_frame_age(void);

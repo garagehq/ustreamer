@@ -1028,6 +1028,9 @@ static void _http_callback_blocking_background(struct evhttp_request *request, v
 	evbuffer_free(buf);
 }
 
+// /snapshot/raw older than this wakes the encoder for one frame
+#define RAW_FRAME_STALE_S 1.0
+
 // Raw snapshot endpoint - returns unmodified video frame even when blocking is active
 // This is used by OCR to detect ad content during blocking mode
 static void _http_callback_snapshot_raw(struct evhttp_request *request, void *v_server) {
@@ -1041,6 +1044,14 @@ static void _http_callback_snapshot_raw(struct evhttp_request *request, void *v_
 		_A_ADD_HEADER(request, "Location", "/snapshot");
 		evhttp_send_reply(request, HTTP_MOVETEMP, "Temporary Redirect", NULL);
 		return;
+	}
+
+	// A stale raw frame means nothing is driving the encoder (no stream
+	// client): ask for one encode so the next request gets a fresh frame, and
+	// tell the caller how old this one is (X-Raw-Age) so it can retry.
+	const double raw_age = us_blocking_raw_frame_age();
+	if (raw_age > RAW_FRAME_STALE_S) {
+		atomic_fetch_add(&server->stream->run->http->snapshot_requested, 1);
 	}
 
 	// Get raw frame data (this locks the mutex)
@@ -1137,6 +1148,11 @@ static void _http_callback_snapshot_raw(struct evhttp_request *request, void *v_
 	_A_ADD_HEADER(request, "Pragma", "no-cache");
 	_A_ADD_HEADER(request, "Expires", "Mon, 3 Jan 2000 12:34:56 GMT");
 	_A_ADD_HEADER(request, "X-Raw-Snapshot", "true");
+	{
+		char age_str[32];
+		snprintf(age_str, sizeof(age_str), "%.3f", (raw_age > 1e6 ? 1e6 : raw_age));
+		_A_ADD_HEADER(request, "X-Raw-Age", age_str);
+	}
 
 	evhttp_send_reply(request, HTTP_OK, "OK", buf);
 
