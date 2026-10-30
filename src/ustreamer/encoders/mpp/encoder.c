@@ -85,6 +85,7 @@ static int _encode_buffer(us_mpp_encoder_s *enc, MppBuffer mbuf, us_frame_s *des
 static int _compress_rga(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_s *dest);
 static int _rga_convert_to_buf(us_mpp_encoder_s *enc, const us_frame_s *src, int dst_fd, uint hs, uint vs);
 static int _compress_rga_scale(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_s *dest, uint tw, uint th);
+static int _rga_scale_to_frame_buf(us_mpp_encoder_s *enc, const us_frame_s *src, uint tw, uint th);
 static int _rga_get_handle(us_mpp_encoder_s *enc, int fd, uint w, uint h, uint fmt);
 static void _release_rga_handles(us_mpp_encoder_s *enc);
 #endif
@@ -385,6 +386,25 @@ static int _rga_convert_to_buf(us_mpp_encoder_s *enc, const us_frame_s *src, int
 }
 
 static int _compress_rga_scale(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame_s *dest, uint tw, uint th) {
+	if (_rga_scale_to_frame_buf(enc, src, tw, th) < 0) {
+		return -1;
+	}
+
+	us_frame_encoding_begin(src, dest, V4L2_PIX_FMT_JPEG);
+	if (_encode_buffer(enc, enc->frame_buf, dest) < 0) {
+		return -1;
+	}
+	us_frame_encoding_end(dest);
+	_LOG_VERBOSE("RGA resize: %ux%u -> %ux%u, %zu bytes, time=%0.3Lf",
+		src->width, src->height, tw, th, dest->used,
+		dest->encode_end_ts - dest->encode_begin_ts);
+	return 0;
+}
+
+// Scales src to tw x th NV12 in enc->frame_buf (converting NV24/BGR24 on
+// the way), without encoding. Shared by the resize path and the CPU path,
+// which composites the overlay onto the scaled frame.
+static int _rga_scale_to_frame_buf(us_mpp_encoder_s *enc, const us_frame_s *src, uint tw, uint th) {
 	if (_mpp_encoder_prepare(enc, tw, th, V4L2_PIX_FMT_NV12,
 			MPP_ALIGN(tw, 16), MPP_ALIGN(th, 16)) < 0) {
 		return -1;
@@ -457,15 +477,6 @@ static int _compress_rga_scale(us_mpp_encoder_s *enc, const us_frame_s *src, us_
 			src->width, src->height, tw, th, imStrError(ret));
 		return -1;
 	}
-
-	us_frame_encoding_begin(src, dest, V4L2_PIX_FMT_JPEG);
-	if (_encode_buffer(enc, enc->frame_buf, dest) < 0) {
-		return -1;
-	}
-	us_frame_encoding_end(dest);
-	_LOG_VERBOSE("RGA resize: %ux%u -> %ux%u, %zu bytes, time=%0.3Lf",
-		src->width, src->height, tw, th, dest->used,
-		dest->encode_end_ts - dest->encode_begin_ts);
 	return 0;
 }
 
@@ -650,7 +661,40 @@ static int _compress_copy(us_mpp_encoder_s *enc, const us_frame_s *src, us_frame
 
 	size_t buf_size = mpp_buffer_get_size(enc->frame_buf);
 
-	if (needs_nv24_conversion) {
+	// The converters below write the full source size, but frame_buf is
+	// sized for the target. Converting a 4K BGR24/NV24 frame for a 2K
+	// encode overran it and killed ustreamer the moment an overlay forced
+	// this path. Scale while converting instead, like NV12 does.
+	bool scaled = false;
+	if (needs_downscale && (needs_nv24_conversion || needs_bgr24_conversion)) {
+#ifdef WITH_RGA
+		if (!enc->rga_scale_broken && src->dma_fd >= 0
+				&& _rga_scale_to_frame_buf(enc, src, target_width, target_height) == 0) {
+			scaled = true;
+		}
+#endif
+		if (!scaled) {
+			const size_t full_size = (size_t)src->width * src->height * 3 / 2;
+			u8 *full = malloc(full_size);
+			if (full == NULL) {
+				_LOG_ERROR("Failed to allocate %zu-byte conversion buffer", full_size);
+				mpp_frame_deinit(&mpp_frame);
+				return -1;
+			}
+			if (needs_nv24_conversion) {
+				_convert_nv24_to_nv12(src->data, src->width, src->height, full, src->width, src->height);
+			} else {
+				_convert_bgr24_to_nv12(src->data, src->width, src->height, full, src->width, src->height);
+			}
+			_downscale_nv12(full, src->width, src->height, buf_ptr, target_width, target_height);
+			free(full);
+			scaled = true;
+		}
+	}
+
+	if (scaled) {
+		// Already converted and scaled into frame_buf above
+	} else if (needs_nv24_conversion) {
 		// Convert NV24 to NV12 for MPP encoder
 		// This enables encoding from sources like Roku that output NV24
 		_convert_nv24_to_nv12(src->data, src->width, src->height,
